@@ -9,6 +9,7 @@ Layers
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -38,6 +39,10 @@ DEFAULT_WEIGHTS = {"price": 60.0, "flow": 25.0, "dex": 15.0}
 # --------------------------------------------------------------------------- loading
 def detect_kind(columns) -> str | None:
     c = {str(x).strip() for x in columns}
+    lc = {x.lower() for x in c}
+    if ({"open", "high", "low"} <= lc and lc & {"close", "last", "adj close"}
+            and lc & {"date", "time", "datetime", "timestamp"}):
+        return "ohlc"
     if {"Bid x Size", "Premium", "Side"} <= c:
         return "flow"
     if {"Vol/OI", "Moneyness"} <= c:
@@ -138,6 +143,41 @@ def parse_em(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
     return d
+
+
+def parse_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """Daily OHLC from Yahoo / TradingView / Barchart style exports -> columns date, open, high, low, close."""
+    lc = {str(c).strip().lower(): c for c in df.columns}
+    dcol = next(lc[k] for k in ("date", "datetime", "time", "timestamp") if k in lc)
+    ccol = next(lc[k] for k in ("close", "last", "adj close") if k in lc)
+    raw = df[dcol]
+    asnum = pd.to_numeric(raw, errors="coerce")
+    if asnum.notna().mean() > 0.9:                      # unix seconds / milliseconds (TradingView)
+        dates = pd.to_datetime(asnum, unit="ms" if asnum.median() > 1e11 else "s", errors="coerce")
+    else:
+        dates = pd.to_datetime(raw, errors="coerce")
+    try:
+        dates = dates.dt.tz_localize(None)
+    except (TypeError, AttributeError):
+        pass
+
+    def num(col):
+        return pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+
+    out = pd.DataFrame({"date": dates.dt.normalize(), "open": num(lc["open"]), "high": num(lc["high"]),
+                        "low": num(lc["low"]), "close": num(ccol)})
+    out = out.dropna().drop_duplicates("date").sort_values("date").reset_index(drop=True)
+    if len(out) < 20:
+        raise ValueError("OHLC file needs at least 20 valid daily rows")
+    return out
+
+
+def spearman(a: pd.Series, b: pd.Series) -> float:
+    """Spearman rank correlation without scipy (pandas' method='spearman' imports scipy)."""
+    s = pd.concat([a, b], axis=1).dropna()
+    if len(s) < 3:
+        return float("nan")
+    return float(s.iloc[:, 0].rank().corr(s.iloc[:, 1].rank()))
 
 
 # --------------------------------------------------------------------------- price / spot helpers
@@ -273,6 +313,7 @@ def gamma_regime(gex_exp: pd.DataFrame | None, hist_last_gex: float, spot: float
     if gex_exp is None:
         state = "Negative" if hist_last_gex < 0 else "Positive"
         return {"state": state, "effective": state, "near_flip": False, "net": hist_last_gex, "flip": np.nan,
+                "flip_min": np.nan, "flip_max": np.nan, "flip_nearest": np.nan, "flip_nearest_date": None,
                 "table": pd.DataFrame(), "source": "history file (net GEX OI sign)"}
     g = gex_exp.copy()
     g["dte"] = (g["date"] - asof).dt.days
@@ -283,8 +324,41 @@ def gamma_regime(gex_exp: pd.DataFrame | None, hist_last_gex: float, spot: float
     flip = float(np.average(w.loc[ok, "gamma_flip"], weights=size[ok])) if ok.any() else np.nan
     state = "Negative" if net < 0 else "Positive"
     near = bool(not np.isnan(flip) and abs(spot - flip) / spot < flip_buffer)
+    fl = w.loc[ok].sort_values("dte")
     return {"state": state, "effective": "Negative" if near else state, "near_flip": near, "net": net,
-            "flip": flip, "table": w, "source": f"net GEX over expiries {min_dte}-{max_dte} DTE"}
+            "flip": flip,
+            "flip_min": float(fl["gamma_flip"].min()) if len(fl) else np.nan,
+            "flip_max": float(fl["gamma_flip"].max()) if len(fl) else np.nan,
+            "flip_nearest": float(fl["gamma_flip"].iloc[0]) if len(fl) else np.nan,
+            "flip_nearest_date": fl["date"].iloc[0] if len(fl) else None,
+            "table": w, "source": f"net GEX over expiries {min_dte}-{max_dte} DTE"}
+
+
+def profile_flip(gs: pd.DataFrame | None, spot: float) -> dict | None:
+    """All-expiry gamma flip: where the GEX-by-strike profile curve crosses zero (nearest crossing to spot).
+
+    Needs the `gex_profile` column of the GEX-by-strike file. Returns None when that column is missing/empty.
+    `flip` is NaN when the curve never crosses zero.
+    """
+    if gs is None or "gex_profile" not in gs:
+        return None
+    p = gs[["strike", "gex_profile"]].apply(pd.to_numeric, errors="coerce").dropna().sort_values("strike")
+    p = p.drop_duplicates("strike").reset_index(drop=True)
+    if len(p) < 3:
+        return None
+    x, y = p["strike"].to_numpy(float), p["gex_profile"].to_numpy(float)
+    crossings = []
+    for i in range(len(p) - 1):
+        if y[i] == 0:
+            crossings.append((float(x[i]), True))
+        elif y[i] * y[i + 1] < 0:
+            crossings.append((float(x[i] - y[i] * (x[i + 1] - x[i]) / (y[i + 1] - y[i])), bool(y[i + 1] > y[i])))
+    at_spot = float(np.interp(spot, x, y))
+    flip, up = (np.nan, None)
+    if crossings:
+        flip, up = min(crossings, key=lambda c: abs(c[0] - spot))
+    return {"flip": float(flip), "up_crossing": up, "value_at_spot": at_spot,
+            "state_at_spot": "Negative" if at_spot < 0 else "Positive", "crossings": [c[0] for c in crossings]}
 
 
 def band_from_score(score: float, t_mild: float = 0.10, t_strong: float = 0.30) -> str:
@@ -331,7 +405,7 @@ def backtest_tables(hc: pd.DataFrame, weights: dict, t_mild=0.10, t_strong=0.30,
         row = {"signal": k}
         for h in (1, 5, 10):
             s = t[[k, f"f{h}"]].dropna()
-            row[f"IC_{h}d"] = round(s[k].corr(s[f"f{h}"], method="spearman"), 3)
+            row[f"IC_{h}d"] = round(spearman(s[k], s[f"f{h}"]), 3)
         ic_rows.append(row)
     band_rows = []
     for b in BANDS:
@@ -346,7 +420,7 @@ def backtest_tables(hc: pd.DataFrame, weights: dict, t_mild=0.10, t_strong=0.30,
     stab = {}
     for name, s in (("first half", t.iloc[:half]), ("second half", t.iloc[half:])):
         s = s[["score", "f5"]].dropna()
-        stab[name] = round(s["score"].corr(s["f5"], method="spearman"), 3)
+        stab[name] = round(spearman(s["score"], s["f5"]), 3)
     return {"ic": pd.DataFrame(ic_rows), "bands": pd.DataFrame(band_rows), "regime": reg,
             "stability": stab, "n": len(t), "start": t["Date"].iloc[0], "end": t["Date"].iloc[-1],
             "rows": t}
@@ -723,6 +797,106 @@ def pick_strategies(builder: Builder, band: str, regime: str, top_n: int = 5) ->
     return out
 
 
+# --------------------------------------------------------------------------- trend cards (GEX / DEX history)
+def trend_card(series: pd.Series, short: int = 5, long: int = 20, z_window: int = 120, flat_z: float = 0.3):
+    """Is a signed exposure series strengthening (|x| growing in its current sign) or weakening (moving to zero)?
+
+    The 5-day change is compared with the typical 5-day change over the last 120 sessions (its standard
+    deviation); a move smaller than `flat_z` such deviations counts as steady.
+    """
+    s = series.dropna()
+    if len(s) < long + 5:
+        return None
+    now = float(s.iloc[-1])
+    d_short = now - float(s.iloc[-1 - short])
+    d_long = now - float(s.iloc[-1 - long])
+    win = s.tail(z_window)
+    sd = float(s.diff(short).tail(z_window).std())
+    z = d_short / sd if sd > 0 else 0.0
+    sign = "Negative" if now < 0 else "Positive"
+    toward_zero = (d_short > 0) if now < 0 else (d_short < 0)
+    trend = "steady" if abs(z) < flat_z else ("weakening" if toward_zero else "strengthening")
+    sg = np.sign(s.values)
+    run = 1
+    for i in range(len(s) - 2, -1, -1):
+        if sg[i] == sg[-1]:
+            run += 1
+        else:
+            break
+    return {"value": now, "sign": sign, "trend": trend, "d_short": d_short, "d_long": d_long, "z": float(z),
+            "pctile": float((win < now).mean()), "days_in_sign": run, "agree": bool(np.sign(d_short) == np.sign(d_long)),
+            "tail": s.tail(60), "short": short, "long": long}
+
+
+# --------------------------------------------------------------------------- candlestick data and Vega-Lite spec
+UP_COLOR, DOWN_COLOR = "#26a69a", "#ef5350"
+OVERLAYS = {
+    "200 EMA": (["ema200"], "#4c9be8", [1, 0]),
+    "Donchian 20": (["hi20", "lo20"], "#f5a623", [1, 0]),
+    "Donchian 55": (["hi55", "lo55"], "#9b59b6", [6, 3]),
+}
+
+
+def candle_frame(hc: pd.DataFrame, ohlc: pd.DataFrame | None = None):
+    """Returns (frame with date/open/high/low/close/ema200/hi20/lo20/hi55/lo55, mode)."""
+    ema = hc.set_index("Date")["ema200"]
+    if ohlc is not None and len(ohlc) >= 60:
+        o = ohlc.copy()
+        o["hi20"], o["lo20"] = o["high"].rolling(20).max(), o["low"].rolling(20).min()
+        o["hi55"], o["lo55"] = o["high"].rolling(55).max(), o["low"].rolling(55).min()
+        own = o["close"].ewm(span=200, adjust=False).mean()
+        o["ema200"] = o["date"].map(ema).fillna(own)       # prefer the longer history file for the EMA
+        return o, "ohlc"
+    d = hc[["Date", "Close Price", "ema200", "hi20", "lo20", "hi55", "lo55"]].rename(
+        columns={"Date": "date", "Close Price": "close"}).copy()
+    d["open"] = d["close"].shift(1).fillna(d["close"])
+    d["high"] = d[["open", "close"]].max(axis=1)
+    d["low"] = d[["open", "close"]].min(axis=1)
+    return d, "close-to-close"
+
+
+def candle_spec(frame: pd.DataFrame, overlays, days: int = 126, height: int = 420) -> dict:
+    d = frame.tail(days)
+    fields = []
+    for name in overlays:
+        fields += OVERLAYS[name][0]
+    cols = ["date", "open", "high", "low", "close"] + fields
+    records = json.loads(d[cols].to_json(orient="records", date_format="iso"))   # NaN -> null
+    lo = float(np.nanmin(d[["low"] + fields].to_numpy(dtype=float)))
+    hi = float(np.nanmax(d[["high"] + fields].to_numpy(dtype=float)))
+    pad = (hi - lo) * 0.03 or 1.0
+    domain = [math.floor(lo - pad), math.ceil(hi + pad)]
+    x = {"field": "date", "type": "temporal", "axis": {"title": None, "format": "%b %d", "labelOverlap": True}}
+
+    def y(field):
+        return {"field": field, "type": "quantitative", "scale": {"zero": False, "domain": domain},
+                "axis": {"title": "QQQ"}}
+
+    color = {"condition": {"test": "datum.close >= datum.open", "value": UP_COLOR}, "value": DOWN_COLOR}
+    tip = [{"field": "date", "type": "temporal", "title": "Date", "format": "%Y-%m-%d"},
+           {"field": "open", "type": "quantitative", "title": "Open", "format": ".2f"},
+           {"field": "high", "type": "quantitative", "title": "High", "format": ".2f"},
+           {"field": "low", "type": "quantitative", "title": "Low", "format": ".2f"},
+           {"field": "close", "type": "quantitative", "title": "Close", "format": ".2f"}]
+    bar = int(max(2, min(10, 650 / max(len(d), 1) * 0.7)))
+    layers = [
+        {"mark": {"type": "rule"}, "encoding": {"x": x, "y": y("low"), "y2": {"field": "high"}, "color": color,
+                                                  "tooltip": tip}},
+        {"mark": {"type": "bar", "size": bar}, "encoding": {"x": x, "y": y("open"), "y2": {"field": "close"},
+                                                              "color": color, "tooltip": tip}},
+    ]
+    for name in overlays:
+        flds, col, dash = OVERLAYS[name]
+        for f in flds:
+            layers.append({"mark": {"type": "line", "color": col, "strokeWidth": 1.4, "strokeDash": dash},
+                           "encoding": {"x": x, "y": y(f)}})
+    spec = {"$schema": "https://vega.github.io/schema/vega-lite/v5.json", "data": {"values": records},
+            "width": "container", "height": height, "layer": layers,
+            "config": {"axis": {"gridOpacity": 0.25}}}
+    json.dumps(spec, allow_nan=False)      # raises if anything non-JSON slipped in
+    return spec
+
+
 # --------------------------------------------------------------------------- one-call analysis
 def analyse(data: dict, weights: dict, opts: dict) -> dict:
     """data: kind -> raw dataframe. Returns everything the UI needs."""
@@ -764,7 +938,24 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
         }
     builder = Builder(chain, spot, asof, em, gs, ivtab, opts["structure"], ivr, opts.get("edge_threshold", 1.5))
     strategies = pick_strategies(builder, ds["band"], reg["effective"], opts.get("top_n", 5))
-    return {"hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
+    hs = hc.set_index("Date")
+    gex_trend = trend_card(hs["GEX Net OI"])
+    dex_trend = trend_card(hs["DEX Net OI"])
+    dex_window = np.nan
+    if dex_exp is not None:
+        dd = dex_exp.assign(dte=(dex_exp["date"] - asof).dt.days)
+        dex_window = float(dd[(dd["dte"] >= opts.get("reg_min_dte", 1)) & (dd["dte"] <= opts.get("reg_max_dte", 45))]
+                           ["net_dex"].sum())
+    ohlc = None
+    if "ohlc" in data:
+        try:
+            ohlc = parse_ohlc(data["ohlc"])
+        except Exception:
+            ohlc = None
+    candles, candle_mode = candle_frame(hc, ohlc)
+    return {"agg_flip": profile_flip(gs, spot),
+            "gex_trend": gex_trend, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
+            "candle_mode": candle_mode, "hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
             "flow": fl, "flow_source": flow_source, "dex_hist": float(last["dex"]), "dex_exp": dexs,
             "ivrank": ivr, "edge": edge, "ivtab": ivtab, "walls": walls, "em": em, "gex_exp": gex_exp,
             "dex_exp_df": dex_exp, "strategies": strategies, "builder": builder,

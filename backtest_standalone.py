@@ -6,7 +6,15 @@ Usage: python3 -I backtest.py [path_to_option_history_csv]
 import sys
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+import math
+
+
+def spearmanr(a, b):
+    """Rank correlation without scipy; the p-value is a normal approximation (fine for n > 100)."""
+    s = pd.concat([pd.Series(np.asarray(a)), pd.Series(np.asarray(b))], axis=1).dropna()
+    r = float(s.iloc[:, 0].rank().corr(s.iloc[:, 1].rank()))
+    t = r * math.sqrt((len(s) - 2) / max(1 - r * r, 1e-12))
+    return r, math.erfc(abs(t) / math.sqrt(2))
 
 PATH = sys.argv[1] if len(sys.argv) > 1 else '/mnt/user-data/uploads/option_history_qqq.csv'
 HORIZONS = (1, 5, 10)
