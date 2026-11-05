@@ -18,3 +18,6 @@ Tests (no Streamlit needed):  python3 test_core.py <folder_with_csvs>
 
 Caveats: backtest covers ~19 months in one bull regime; GEX/DEX/walls are model estimates; multi-expiry P&L is
 Black-Scholes with flat IV; POP is a lognormal estimate; this is a research tool, not financial advice.
+
+## Link
+https://dealerpositioningbacktest-vydwrk6jfuj4ysbptutjxa.streamlit.app/
