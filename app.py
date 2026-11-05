@@ -1,6 +1,7 @@
 """Streamlit UI for the layered QQQ regime scorer.  Run:  streamlit run app.py
 All logic lives in core.py; this file only collects inputs and displays results."""
 import datetime as dt
+import importlib
 import inspect
 import os
 
@@ -11,6 +12,18 @@ import streamlit as st
 import core
 
 st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
+
+# app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
+# old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
+EXPECTED_CORE = "2026-11-05.2"
+if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
+    core = importlib.reload(core)
+if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
+    st.error(f"core.py is out of date: found version {getattr(core, 'CORE_VERSION', 'none (pre-2026-11-05)')}, "
+             f"but app.py needs {EXPECTED_CORE}. Copy BOTH app.py and core.py from the same zip into the app "
+             "folder (or repo), commit/save, then reboot the app so Streamlit drops its cached copy.")
+    st.stop()
+
 st.title("Regime & Strategy Selector")
 st.caption("Layered scorer: direction (price / flow / DEX) -> gates (IV rank, term structure) -> "
            "gamma regime -> strategy matrix. Research tool, not financial advice.")

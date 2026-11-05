@@ -26,3 +26,6 @@ Tests (no Streamlit needed):  python3 test_core.py <folder>   and   python3 test
 
 Caveats: backtest covers ~19 months in one bull regime; GEX/DEX/walls are model estimates; multi-expiry P&L is
 Black-Scholes with flat IV; POP is a lognormal estimate; this is a research tool, not financial advice.
+
+Updating: always replace app.py AND core.py together (they are versioned as a pair; app.py stops with a clear
+message if core.py is out of date). On Streamlit Cloud, commit both files, then use Manage app -> Reboot.

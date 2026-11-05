@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+CORE_VERSION = "2026-11-05.2"   # app.py refuses to run against a core.py with a different stamp
+
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
 # Strategy matrix: (band, gamma regime) -> ordered strategy names
