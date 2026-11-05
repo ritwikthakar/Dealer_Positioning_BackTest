@@ -29,3 +29,7 @@ Black-Scholes with flat IV; POP is a lognormal estimate; this is a research tool
 
 Updating: always replace app.py AND core.py together (they are versioned as a pair; app.py stops with a clear
 message if core.py is out of date). On Streamlit Cloud, commit both files, then use Manage app -> Reboot.
+
+### Link
+https://dealerpositioningbacktest-vydwrk6jfuj4ysbptutjxa.streamlit.app/
+
