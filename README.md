@@ -1,0 +1,20 @@
+# Regime & Strategy Selector
+
+Layered scorer for QQQ-style option data (OptionCharts + Barchart exports).
+
+    pip install -r requirements.txt
+    set QQQ_DATA_DIR=C:\path\to\csvs      (or paste the folder in the sidebar, or upload the files)
+    streamlit run app.py
+
+Files are recognised by their columns, so names don't matter. Required: option history + option chain.
+Optional (used when present): flow, unusual activity, DEX/GEX by expiration, GEX by strike, expected move.
+
+Layers: direction score (price 60 / flow 25 / DEX 15, editable) -> gates (IV rank, front-back IV edge)
+-> gamma regime (sign of net GEX over the trade's expiry window, near-flip buffer) -> matrix -> strikes
+from expected-move bands and GEX walls. Calendars and condors are blocked when their gate fails.
+
+Tests (no Streamlit needed):  python3 test_core.py <folder_with_csvs>
+`backtest_standalone.py` is the corrected standalone backtest (fixes a vol-score scaling bug in the earlier copy).
+
+Caveats: backtest covers ~19 months in one bull regime; GEX/DEX/walls are model estimates; multi-expiry P&L is
+Black-Scholes with flat IV; POP is a lognormal estimate; this is a research tool, not financial advice.
