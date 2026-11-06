@@ -44,3 +44,6 @@ tickers) for breakout, pullback, squeeze and failed-breakout setups, grades them
 Files: `screener_tab.py` (UI) and `donchian_screener.py` (logic, also runnable alone: `python3 donchian_screener.py AAPL MSFT`).
 Needs `yfinance` and `lxml` (see requirements.txt) and internet access from wherever the app runs.
 Tests: `python3 test_screener_tab.py` (tab, stand-in Streamlit) and `python3 test_screener.py` (screener logic).
+
+## Link
+https://dealerpositioningbacktest-vydwrk6jfuj4ysbptutjxa.streamlit.app/
