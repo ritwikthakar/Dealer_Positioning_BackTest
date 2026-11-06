@@ -12,12 +12,13 @@ import io
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
-CORE_VERSION = "2026-11-05.2"   # app.py refuses to run against a core.py with a different stamp
+CORE_VERSION = "2026-11-05.3"   # app.py refuses to run against a core.py with a different stamp
 
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
@@ -100,7 +101,7 @@ def load_uploads(files) -> dict[str, pd.DataFrame]:
 
 
 def _num(s: pd.Series) -> pd.Series:
-    """Parse '1.2B', '875.91M', '754.93K', '21.23%', '6,780', '—' into floats (percent kept in % units)."""
+    """Parse '1.2B', '875.91M', '754.93K', '21.23%', '6,780', '(em dash)' into floats (percent kept in % units)."""
     s = s.astype(str).str.replace(",", "", regex=False).str.strip()
     mult = s.str[-1].map({"K": 1e3, "M": 1e6, "B": 1e9}).fillna(1.0)
     base = pd.to_numeric(s.str.replace(r"[KMB%]$", "", regex=True), errors="coerce")
@@ -121,12 +122,28 @@ def parse_chain(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["exp"] = pd.to_datetime(d["expiration_date"].astype(str).str[:10])
     d["cp"] = d["type"].astype(str).str[0].str.upper()
-    for c in ["strike", "bid", "ask", "mid", "implied_volatility", "delta", "volume", "open_interest"]:
+    for c in ["strike", "bid", "ask", "mid", "implied_volatility", "delta", "gamma", "volume", "open_interest"]:
         if c in d:
             d[c] = pd.to_numeric(d[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    if "oi_chg" in d:
+        d["oi_chg_n"], d["oi_chg_pct"] = parse_oi_chg(d["oi_chg"])
+    else:
+        d["oi_chg_n"], d["oi_chg_pct"] = np.nan, np.nan
     d = d.dropna(subset=["strike"])
     d = d.drop_duplicates(["exp", "cp", "strike"], keep="first").reset_index(drop=True)
     return d
+
+
+def parse_oi_chg(s: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """'+9 (+40.91%)' -> (9.0, 40.91); '-17 (-100.00%)' -> (-17.0, -100.0); '(em dash)' / blanks -> NaN (unknown, not zero).
+
+    The change is versus the previous day's open interest (checked on the sample: OI minus change is never negative
+    and the printed percentage equals change / (OI - change))."""
+    t = s.astype(str).str.strip()
+    ext = t.str.extract(r"^([+-]?[\d,]+(?:\.\d+)?)\s*(?:\(\s*([+-]?[\d,]*\.?\d+)\s*%\s*\))?$")
+    chg = pd.to_numeric(ext[0].str.replace(",", "", regex=False), errors="coerce")
+    pct = pd.to_numeric(ext[1].str.replace(",", "", regex=False), errors="coerce")
+    return chg, pct
 
 
 def parse_gex_exp(df: pd.DataFrame) -> pd.DataFrame:
@@ -452,6 +469,8 @@ class Leg:
     bid: float
     ask: float
     iv: float
+    oi: float = float("nan")        # open interest of this contract (display only)
+    oi_chg: float = float("nan")    # change vs previous day; NaN = unknown
 
 
 @dataclass
@@ -545,7 +564,10 @@ class Builder:
         if g.empty:
             return None
         r = g.iloc[0]
-        return Leg(cp, float(strike), exp, qty, float(r["bid"]), float(r["ask"]), float(r["implied_volatility"]))
+        oi = float(r["open_interest"]) if "open_interest" in g.columns else float("nan")
+        chg = float(r["oi_chg_n"]) if "oi_chg_n" in g.columns else float("nan")
+        return Leg(cp, float(strike), exp, qty, float(r["bid"]), float(r["ask"]), float(r["implied_volatility"]),
+                   oi, chg)
 
     def put_wall(self, lo, hi):
         if self.gs is None:
@@ -899,6 +921,185 @@ def candle_spec(frame: pd.DataFrame, overlays, days: int = 126, height: int = 42
     return spec
 
 
+# --------------------------------------------------------------------------- open-interest change (display only)
+# Not part of the direction score: the sample has a single day of changes, so it cannot be backtested, and OI is
+# published after the close (the change describes the PREVIOUS session's trading). Used for context and tie-breaks.
+OI_DEFAULTS = {"build_pct": 0.10, "strong_pct": 0.25, "min_contracts": 500, "band": 0.08, "min_known": 0.5}
+OI_ARROWS = {"strong build": "\u25b2\u25b2", "build": "\u25b2", "flat": "\u2013", "erode": "\u25bc",
+             "strong erode": "\u25bc\u25bc", "n/a": "?"}
+
+
+def oi_tag(chg, prior, build_pct=0.10, strong_pct=0.25, min_contracts=500) -> str:
+    """strong build / build / flat / erode / strong erode, or n/a when the change is unknown.
+
+    A move needs both a relative size (vs prior open interest) and an absolute size (contracts) to count."""
+    if chg is None or prior is None or not np.isfinite(chg) or not np.isfinite(prior):
+        return "n/a"
+    if abs(chg) < min_contracts:
+        return "flat"
+    pct = chg / prior if prior > 0 else float("inf")      # brand-new open interest counts as a strong build
+    if pct >= strong_pct:
+        return "strong build"
+    if pct >= build_pct:
+        return "build"
+    if pct <= -strong_pct:
+        return "strong erode"
+    if pct <= -build_pct:
+        return "erode"
+    return "flat"
+
+
+def oi_arrow(tag: str) -> str:
+    return OI_ARROWS.get(tag, "?")
+
+
+def oi_change_tables(chain: pd.DataFrame, spot: float, asof: pd.Timestamp, min_dte: int = 1, max_dte: int = 45,
+                     params: dict | None = None, top_n: int = 12) -> dict | None:
+    """Open-interest change by strike, by expiration and by contract over the trade window (default 1-45 DTE,
+    within +/-8% of spot). Returns None if the chain has no usable change column.
+
+    - Unknown changes ('(em dash)' with open interest) are NOT treated as zero: they are excluded from percentages and tags,
+      and `known_share` reports how much of the open interest has a change figure.
+    - d_gex = (+call / -put) x gamma x change x 100 x spot^2 x 1%: the same convention as the GEX-by-strike file
+      (checked on its levels: ratio 0.99, rank correlation 1.0), so it is in the same units, a model estimate.
+    """
+    p = {**OI_DEFAULTS, **(params or {})}
+    if "oi_chg_n" not in chain.columns or chain["oi_chg_n"].notna().sum() == 0:
+        return None
+    c = chain.copy()
+    c["dte"] = (c["exp"] - asof).dt.days
+    w = c[(c["dte"] >= min_dte) & (c["dte"] <= max_dte)
+          & c["strike"].between(spot * (1 - p["band"]), spot * (1 + p["band"]))].copy()
+    if w.empty:
+        return None
+    w["open_interest"] = w["open_interest"].fillna(0.0)
+    w["known"] = w["oi_chg_n"].notna()
+    w["chg"] = w["oi_chg_n"].fillna(0.0)
+    w["prior_k"] = np.where(w["known"], w["open_interest"] - w["chg"], 0.0)
+    w["oi_k"] = np.where(w["known"], w["open_interest"], 0.0)
+    gamma = pd.to_numeric(w["gamma"], errors="coerce").fillna(0.0) if "gamma" in w else 0.0
+    w["d_gex"] = np.where(w["cp"] == "C", 1.0, -1.0) * gamma * w["chg"] * 100 * spot * spot * 0.01
+
+    def row_tag(oi, oi_k, chg, prior):
+        if oi <= 0:
+            return "flat"
+        if oi_k / oi < p["min_known"]:
+            return "n/a"
+        return oi_tag(chg, prior, p["build_pct"], p["strong_pct"], p["min_contracts"])
+
+    def wide(keys):
+        g = w.groupby(keys + ["cp"]).agg(oi=("open_interest", "sum"), chg=("chg", "sum"), prior=("prior_k", "sum"),
+                                         oi_k=("oi_k", "sum"), d_gex=("d_gex", "sum")).reset_index()
+        out = None
+        for cp, name in (("C", "call"), ("P", "put")):
+            s = g[g["cp"] == cp].drop(columns="cp").set_index(keys)
+            s = s.rename(columns={"oi": f"{name}_oi", "chg": f"{name}_chg", "prior": f"{name}_prior",
+                                  "oi_k": f"{name}_oik", "d_gex": f"{name}_dgex"})
+            out = s if out is None else out.join(s, how="outer")
+        out = out.fillna(0.0).reset_index()
+        for name in ("call", "put"):
+            out[f"{name}_pct"] = np.where(out[f"{name}_prior"] > 0,
+                                          out[f"{name}_chg"] / out[f"{name}_prior"].where(out[f"{name}_prior"] > 0, 1.0),
+                                          np.nan)
+            out[f"{name}_tag"] = [row_tag(a, b, c_, d_) for a, b, c_, d_ in
+                                  zip(out[f"{name}_oi"], out[f"{name}_oik"], out[f"{name}_chg"], out[f"{name}_prior"])]
+        out["d_gex"] = out["call_dgex"] + out["put_dgex"]
+        return out
+
+    by_strike = wide(["strike"]).sort_values("strike").reset_index(drop=True)
+    by_exp = wide(["exp"]).sort_values("exp").reset_index(drop=True)
+    by_exp.insert(1, "dte", (by_exp["exp"] - asof).dt.days)
+    by_exp["note"] = np.where(by_exp["dte"] <= 2, "near expiry: roll/close effects dominate", "")
+
+    k = w[w["known"]].copy()
+    k["abs_chg"] = k["chg"].abs()
+    k["prior"] = k["open_interest"] - k["chg"]
+    k["pct"] = np.where(k["prior"] > 0, k["chg"] / k["prior"].where(k["prior"] > 0, 1.0), np.nan)
+    k["tag"] = [oi_tag(a, b, p["build_pct"], p["strong_pct"], p["min_contracts"]) for a, b in zip(k["chg"], k["prior"])]
+    top = k.sort_values("abs_chg", ascending=False).head(top_n)[
+        ["exp", "dte", "cp", "strike", "open_interest", "chg", "prior", "pct", "d_gex", "tag"]].reset_index(drop=True)
+
+    pos = lambda cp: float(w.loc[(w["cp"] == cp) & (w["chg"] > 0), "chg"].sum())
+    neg = lambda cp: float(-w.loc[(w["cp"] == cp) & (w["chg"] < 0), "chg"].sum())
+    adds_c, adds_p = pos("C"), pos("P")
+    tot_oi = float(w["open_interest"].sum())
+    summary = {
+        "net_call_chg": adds_c - neg("C"), "net_put_chg": adds_p - neg("P"),
+        "call_adds": adds_c, "call_cuts": neg("C"), "put_adds": adds_p, "put_cuts": neg("P"),
+        "put_add_share": adds_p / (adds_p + adds_c) if (adds_p + adds_c) > 0 else float("nan"),
+        "gross_turnover": float(w["chg"].abs().sum()) / tot_oi if tot_oi > 0 else float("nan"),
+        "known_share": float(w["oi_k"].sum()) / tot_oi if tot_oi > 0 else float("nan"),
+        "net_dgex": float(w["d_gex"].sum()), "n_contracts": int(len(w)), "min_dte": min_dte, "max_dte": max_dte,
+        "band": p["band"],
+    }
+    return {"by_strike": by_strike, "by_exp": by_exp, "top": top, "summary": summary, "params": p, "frame": w}
+
+
+def wall_oi_tags(oi: dict | None, walls: dict | None) -> list[dict]:
+    """OI and change at the put wall and call wall strikes (summed over the OI window's expiries)."""
+    if oi is None or not walls:
+        return []
+    bs = oi["by_strike"].set_index("strike")
+    out = []
+    for label, key, side, other in (("Put wall", "put_wall", "put", "call"), ("Call wall", "call_wall", "call", "put")):
+        k = walls.get(key)
+        if k is None or k not in bs.index:
+            out.append({"label": label, "strike": k, "side": side, "available": False})
+            continue
+        r = bs.loc[k]
+        out.append({"label": label, "strike": float(k), "side": side, "other_side": other, "available": True,
+                    "oi": float(r[f"{side}_oi"]), "chg": float(r[f"{side}_chg"]), "pct": float(r[f"{side}_pct"]),
+                    "tag": r[f"{side}_tag"], "other_oi": float(r[f"{other}_oi"]), "other_chg": float(r[f"{other}_chg"]),
+                    "other_tag": r[f"{other}_tag"]})
+    return out
+
+
+SNAP_COLS = ["asof", "spot", "band", "score", "gamma_regime", "net_gex_window", "agg_flip", "put_wall", "call_wall",
+             "put_wall_put_oi", "put_wall_put_chg", "call_wall_call_oi", "call_wall_call_chg", "win_net_call_chg",
+             "win_net_put_chg", "win_put_add_share", "win_gross_turnover", "win_known_share", "win_net_dgex",
+             "top_put_add_strike", "top_call_add_strike"]
+
+
+def snapshot_row(R: dict) -> dict:
+    """One row summarising today's OI-change picture, so a history can be built (and tested) over time."""
+    nan = float("nan")
+    oi, g, d = R.get("oi"), R["regime"], R["direction"]
+    af, wl = R.get("agg_flip"), R.get("walls") or {}
+    row = {c: nan for c in SNAP_COLS}
+    row.update({"asof": str(pd.Timestamp(R["asof"]).date()), "spot": round(float(R["spot"]), 2), "band": d["band"],
+                "score": round(float(d["score"]), 4), "gamma_regime": g["effective"],
+                "net_gex_window": float(g["net"]), "agg_flip": float(af["flip"]) if af else nan,
+                "put_wall": wl.get("put_wall", nan), "call_wall": wl.get("call_wall", nan)})
+    if oi is not None:
+        s = oi["summary"]
+        row.update({"win_net_call_chg": s["net_call_chg"], "win_net_put_chg": s["net_put_chg"],
+                    "win_put_add_share": s["put_add_share"], "win_gross_turnover": s["gross_turnover"],
+                    "win_known_share": s["known_share"], "win_net_dgex": s["net_dgex"]})
+        for t in R.get("oi_walls") or []:
+            if t.get("available"):
+                if t["label"] == "Put wall":
+                    row.update({"put_wall_put_oi": t["oi"], "put_wall_put_chg": t["chg"]})
+                else:
+                    row.update({"call_wall_call_oi": t["oi"], "call_wall_call_chg": t["chg"]})
+        bs = oi["by_strike"]
+        if len(bs):
+            row["top_put_add_strike"] = float(bs.loc[bs["put_chg"].idxmax(), "strike"])
+            row["top_call_add_strike"] = float(bs.loc[bs["call_chg"].idxmax(), "strike"])
+    return row
+
+
+def merge_snapshot(existing: pd.DataFrame | None, row: dict) -> pd.DataFrame:
+    """Append a snapshot, replacing any earlier row for the same as-of date. Keeps a stable column order."""
+    new = pd.DataFrame([row])
+    if existing is not None and len(existing):
+        ex = existing.copy()
+        ex["asof"] = pd.to_datetime(ex["asof"]).dt.strftime("%Y-%m-%d")
+        ex = ex[ex["asof"] != str(row["asof"])]
+        new = pd.concat([ex, new], ignore_index=True) if len(ex) else new
+    new = new.sort_values("asof").reset_index(drop=True)
+    return new.reindex(columns=SNAP_COLS + [c for c in new.columns if c not in SNAP_COLS])
+
+
 # --------------------------------------------------------------------------- one-call analysis
 def analyse(data: dict, weights: dict, opts: dict) -> dict:
     """data: kind -> raw dataframe. Returns everything the UI needs."""
@@ -955,7 +1156,13 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
         except Exception:
             ohlc = None
     candles, candle_mode = candle_frame(hc, ohlc)
-    return {"agg_flip": profile_flip(gs, spot),
+    oi_params = {"build_pct": opts.get("oi_build_pct", OI_DEFAULTS["build_pct"]),
+                 "strong_pct": opts.get("oi_strong_pct", OI_DEFAULTS["strong_pct"]),
+                 "min_contracts": opts.get("oi_min_contracts", OI_DEFAULTS["min_contracts"]),
+                 "band": opts.get("oi_band", OI_DEFAULTS["band"])}
+    oi = oi_change_tables(chain, spot, asof, opts.get("reg_min_dte", 1), opts.get("reg_max_dte", 45), oi_params)
+    return {"oi": oi, "oi_walls": wall_oi_tags(oi, walls), "oi_params": {**OI_DEFAULTS, **oi_params},
+            "agg_flip": profile_flip(gs, spot),
             "gex_trend": gex_trend, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
             "candle_mode": candle_mode, "hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
             "flow": fl, "flow_source": flow_source, "dex_hist": float(last["dex"]), "dex_exp": dexs,

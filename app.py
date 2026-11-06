@@ -3,6 +3,7 @@ All logic lives in core.py; this file only collects inputs and displays results.
 import datetime as dt
 import importlib
 import inspect
+import io
 import os
 
 import numpy as np
@@ -10,12 +11,13 @@ import pandas as pd
 import streamlit as st
 
 import core
+import screener_tab
 
 st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
 # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
 # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
-EXPECTED_CORE = "2026-11-05.2"
+EXPECTED_CORE = "2026-11-05.3"
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
     core = importlib.reload(core)
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
@@ -39,6 +41,24 @@ def fmt_big(x: float) -> str:
     if x is None or np.isnan(x):
         return "n/a"
     return f"{x / 1e9:+.2f}B" if abs(x) >= 1e9 else f"{x / 1e6:+,.0f}M"
+
+
+def fmt_contracts(x: float) -> str:
+    return "n/a" if x is None or np.isnan(x) else f"{x:+,.0f}"
+
+
+def tag_text(tag: str) -> str:
+    return f"{core.oi_arrow(tag)} {tag}"
+
+
+def tag_color(tag: str) -> str:
+    return "blue" if "build" in tag else ("orange" if "erode" in tag else "gray")
+
+
+def leg_trend(leg, p: dict) -> str:
+    if np.isnan(leg.oi_chg) or np.isnan(leg.oi):
+        return "unknown"
+    return tag_text(core.oi_tag(leg.oi_chg, leg.oi - leg.oi_chg, p["build_pct"], p["strong_pct"], p["min_contracts"]))
 
 
 def show_vega(spec: dict) -> None:
@@ -93,6 +113,14 @@ with st.sidebar:
         diag_front = st.number_input("Diagonal short leg: target DTE", 1, 60, 5, key="diag_front")
         diag_gap = st.number_input("Diagonal long leg: days after short", 3, 120, 7, key="diag_gap")
 
+    with st.expander("Open-interest change (display only)"):
+        oi_build = st.number_input("Build / erode threshold (% of prior OI)", 1, 100, 10, key="oi_build")
+        oi_strong = st.number_input("Strong threshold (% of prior OI)", 5, 500, 25, key="oi_strong")
+        oi_min = st.number_input("Minimum change (contracts)", 0, 100000, 500, key="oi_min")
+        oi_band = st.number_input("Strike band around spot (%)", 2, 30, 8, key="oi_band")
+        st.caption("A move must clear both the % and the contract threshold to be tagged. These are judgment "
+                   "calls, not fitted values. OI change is context only and never enters the score.")
+
 # ------------------------------------------------------------------ load data
 data = {}
 if folder.strip():
@@ -108,8 +136,12 @@ for c, (k, label) in zip(cols, KIND_LABELS.items()):
     c.caption(("OK  " if k in data else "missing  ") + label)
 
 if "history" not in data or "chain" not in data:
-    st.info("Point the sidebar at the folder with your CSVs (or upload them). The option history and option chain "
-            "files are required; the others refine the score, regime and charts and are used when present.")
+    tab_need, tab_scr0 = st.tabs(["Score & regime", "Donchian screener"])
+    with tab_need:
+        st.info("Point the sidebar at the folder with your CSVs (or upload them). The option history and option chain "
+                "files are required; the others refine the score, regime and charts and are used when present.")
+    with tab_scr0:                      # the screener needs no option files, so it works before they are loaded
+        screener_tab.render(show_vega)
     st.stop()
 
 weights = {"price": float(w_price), "flow": float(w_flow), "dex": float(w_dex)}
@@ -124,6 +156,8 @@ opts = {
     "structure": {"vert_dte": int(vert_dte), "em_fraction": float(em_fraction), "width": float(width),
                   "cal_front_dte": int(cal_front), "cal_gap": int(cal_gap), "diag_front_dte": int(diag_front),
                   "diag_gap": int(diag_gap)},
+    "oi_build_pct": float(oi_build) / 100.0, "oi_strong_pct": float(oi_strong) / 100.0,
+    "oi_min_contracts": float(oi_min), "oi_band": float(oi_band) / 100.0,
 }
 
 try:
@@ -180,8 +214,8 @@ def trend_card_ui(title, main_text, main_note, tc, kind):
 
 
 # ------------------------------------------------------------------ tabs
-tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt = st.tabs(
-    ["Score & regime", "Strategies", "Dealer map", "Flow", "Volatility", "Backtest"])
+tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt, tab_scr = st.tabs(
+    ["Score & regime", "Strategies", "Dealer map", "Flow", "Volatility", "Backtest", "Donchian screener"])
 
 with tab_over:
     c1, c2, c3, c4 = st.columns(4)
@@ -252,6 +286,43 @@ with tab_over:
                                f"{nd.date() if nd is not None else 'n/a'}: {g['flip_nearest']:.1f}). "
                                "The near-flip check uses this figure. Model estimates.")
 
+    # ---- open-interest change (display only; not part of the score)
+    st.subheader("Open-interest change")
+    oi = R["oi"]
+    if oi is None:
+        st.info("The option chain has no usable oi_chg column, so open-interest changes are unavailable.")
+    else:
+        sm = oi["summary"]
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Net call OI change", fmt_contracts(sm["net_call_chg"]))
+        q1.caption(f"adds {sm['call_adds']:,.0f} / cuts {sm['call_cuts']:,.0f}")
+        q2.metric("Net put OI change", fmt_contracts(sm["net_put_chg"]))
+        q2.caption(f"adds {sm['put_adds']:,.0f} / cuts {sm['put_cuts']:,.0f}")
+        q3.metric("Put share of OI adds", "n/a" if np.isnan(sm["put_add_share"]) else f"{sm['put_add_share']:.0%}")
+        q3.caption("50% = balanced adds; descriptive, not a direction call")
+        q4.metric("One-day turnover", "n/a" if np.isnan(sm["gross_turnover"]) else f"{sm['gross_turnover']:.0%}")
+        q4.caption(f"{sm['known_share']:.0%} of OI has a change figure")
+        if R["oi_walls"]:
+            wcols = st.columns(2)
+            for wc, t in zip(wcols, R["oi_walls"]):
+                with wc, st.container(border=True):
+                    if not t["available"]:
+                        st.markdown(f"**{t['label']}**")
+                        st.caption("No OI-change data at this strike (outside the band or window).")
+                        continue
+                    st.markdown(f"**{t['label']} {t['strike']:.0f}**")
+                    st.markdown(f":{tag_color(t['tag'])}[**{tag_text(t['tag'])}**]")
+                    pct = "" if np.isnan(t["pct"]) else f", {t['pct']:+.0%}"
+                    st.caption(f"{t['side']} OI {t['oi']:,.0f} ({t['chg']:+,.0f}{pct})")
+                    st.caption(f"{t['other_side']} OI at the same strike {t['other_oi']:,.0f} "
+                               f"({t['other_chg']:+,.0f}) {tag_text(t['other_tag'])}")
+        else:
+            st.caption("Add the GEX-by-strike file to tag the put and call walls.")
+        st.caption(f"Change versus the previous session's open interest (published after the close, so it describes "
+                   f"the prior day's trading), summed over expiries {sm['min_dte']}-{sm['max_dte']} DTE within "
+                   f"{sm['band']:.0%} of spot. It cannot say who bought or sold. Display only: not in the score. "
+                   "Strike and expiration detail is on the Dealer map tab.")
+
     # ---- price chart
     st.subheader("Price, 200 EMA and Donchian channels")
     o1, o2, o3 = st.columns([1, 1, 2])
@@ -289,7 +360,10 @@ with tab_strat:
             legs = pd.DataFrame([{
                 "side": "Buy" if l.qty > 0 else "Sell", "qty": abs(l.qty), "expiry": str(l.exp.date()),
                 "DTE": (l.exp - asof).days, "type": "Call" if l.cp == "C" else "Put", "strike": l.strike,
-                "bid": l.bid, "ask": l.ask, "IV %": round(l.iv * 100, 1)} for l in s.legs])
+                "bid": l.bid, "ask": l.ask, "IV %": round(l.iv * 100, 1),
+                "OI": None if np.isnan(l.oi) else int(l.oi),
+                "OI chg": None if np.isnan(l.oi_chg) else int(l.oi_chg),
+                "OI trend": leg_trend(l, R["oi_params"])} for l in s.legs])
             st.dataframe(legs, hide_index=True)
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Net debit (natural)", f"{s.debit_nat:+.2f}")
@@ -325,6 +399,90 @@ with tab_dealer:
         if R["dex_exp_df"] is not None:
             view = view.merge(R["dex_exp_df"][["expiration", "net_dex"]], on="expiration", how="left")
         st.dataframe(view, hide_index=True)
+
+    # ---- open-interest change by strike / expiration / contract
+    st.subheader("Open-interest change")
+    oi = R["oi"]
+    if oi is None:
+        st.info("The option chain has no usable oi_chg column.")
+    else:
+        sm = oi["summary"]
+        st.caption(f"Window: expiries {sm['min_dte']}-{sm['max_dte']} DTE, strikes within {sm['band']:.0%} of spot "
+                   f"({sm['n_contracts']:,} contracts). Change is versus the previous session. Unknown changes are "
+                   f"left out of percentages and tags (known for {sm['known_share']:.0%} of OI). "
+                   "d GEX = gamma x change x 100 x spot^2 x 1%, the same convention as the GEX file, a model estimate.")
+        bsd = oi["by_strike"]
+        ch_plot = bsd.set_index("strike")[["call_chg", "put_chg"]].rename(
+            columns={"call_chg": "call OI change", "put_chg": "put OI change"})
+        st.bar_chart(ch_plot)
+        only = st.checkbox("Only strikes with a build or erode tag", value=True, key="oi_only_moves")
+        sv = bsd.copy()
+        if only:
+            moved = (~sv["call_tag"].isin(["flat", "n/a"])) | (~sv["put_tag"].isin(["flat", "n/a"]))
+            sv = sv[moved]
+        if sv.empty:
+            st.caption("No strike clears the thresholds.")
+        else:
+            st.dataframe(pd.DataFrame({
+                "strike": sv["strike"], "call OI": sv["call_oi"].round(0), "call chg": sv["call_chg"].round(0),
+                "call %": (sv["call_pct"] * 100).round(0), "call trend": sv["call_tag"].map(tag_text),
+                "put OI": sv["put_oi"].round(0), "put chg": sv["put_chg"].round(0),
+                "put %": (sv["put_pct"] * 100).round(0), "put trend": sv["put_tag"].map(tag_text),
+                "d GEX ($M)": (sv["d_gex"] / 1e6).round(1)}), hide_index=True)
+        st.subheader("By expiration")
+        be = oi["by_exp"]
+        st.dataframe(pd.DataFrame({
+            "expiry": be["exp"].dt.date.astype(str), "DTE": be["dte"], "call OI": be["call_oi"].round(0),
+            "call chg": be["call_chg"].round(0), "call trend": be["call_tag"].map(tag_text),
+            "put OI": be["put_oi"].round(0), "put chg": be["put_chg"].round(0), "put trend": be["put_tag"].map(tag_text),
+            "d GEX ($M)": (be["d_gex"] / 1e6).round(1), "note": be["note"]}), hide_index=True)
+        st.subheader("Largest single-contract changes")
+        tp = oi["top"]
+        st.dataframe(pd.DataFrame({
+            "expiry": tp["exp"].dt.date.astype(str), "DTE": tp["dte"], "type": tp["cp"].map({"C": "Call", "P": "Put"}),
+            "strike": tp["strike"], "OI": tp["open_interest"].round(0), "change": tp["chg"].round(0),
+            "change %": (tp["pct"] * 100).round(0), "trend": tp["tag"].map(tag_text),
+            "d GEX ($M)": (tp["d_gex"] / 1e6).round(1)}), hide_index=True)
+
+        # ---- snapshot log: lets you build (and later test) a history of these readings
+        st.subheader("Daily snapshot log")
+        default_snap = os.path.join(os.path.dirname(os.path.abspath(globals().get("__file__", "app.py"))),
+                                    "oi_snapshots.csv")
+        snap_path = st.text_input("Snapshot file", value=os.environ.get("QQQ_SNAPSHOT_FILE", default_snap),
+                                  key="snap_path")
+        log = None
+        try:
+            if os.path.isfile(snap_path):
+                log = pd.read_csv(snap_path)
+        except Exception as ex:
+            st.warning(f"Could not read {snap_path}: {ex}")
+        up = st.file_uploader("Or load a log you downloaded earlier", type=["csv"], key="snap_up")
+        if up is not None:
+            try:
+                prior_log = pd.read_csv(io.BytesIO(up.getvalue()))
+                for _, rr in prior_log.iterrows():
+                    log = core.merge_snapshot(log, rr.to_dict())
+            except Exception as ex:
+                st.warning(f"Could not read the uploaded log: {ex}")
+        today_row = core.snapshot_row(R)
+        if st.button("Save this snapshot", key="snap_save"):
+            try:
+                log = core.merge_snapshot(log, today_row)
+                log.to_csv(snap_path, index=False)
+                st.success(f"Saved the {today_row['asof']} snapshot ({len(log)} rows in {snap_path}).")
+            except Exception as ex:
+                st.error(f"Could not write {snap_path}: {ex}")
+        try:
+            full = core.merge_snapshot(log, today_row)
+        except Exception as ex:
+            st.warning(f"{snap_path} does not look like a snapshot log ({ex}); showing today's row only.")
+            full = core.merge_snapshot(None, today_row)
+        st.caption("One row per as-of date; saving the same date again replaces it. Hosted apps (for example "
+                   "Streamlit Cloud) lose local files on reboot, so download the log and keep it. After several "
+                   "weeks it can be tested against forward returns; one day of data cannot.")
+        st.dataframe(full.tail(30), hide_index=True)
+        st.download_button("Download log (including today's row)", full.to_csv(index=False).encode("utf-8"),
+                           file_name="oi_snapshots.csv", mime="text/csv", key="snap_dl")
 
 with tab_flow:
     f = R["flow"]
@@ -381,3 +539,6 @@ with tab_bt:
                    f"second half {bt['stability']['second half']}. Small bands (n < 30) are noise.")
     except Exception as ex:
         st.error(f"Backtest unavailable: {ex}")
+
+with tab_scr:
+    screener_tab.render(show_vega)
