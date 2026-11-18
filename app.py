@@ -13,6 +13,7 @@ import streamlit as st
 import core
 import screener_tab
 import ichimoku_tab
+import chat_tab
 
 st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
@@ -137,7 +138,7 @@ for c, (k, label) in zip(cols, KIND_LABELS.items()):
     c.caption(("OK  " if k in data else "missing  ") + label)
 
 if "history" not in data or "chain" not in data:
-    tab_need, tab_scr0, tab_ich0 = st.tabs(["Score & regime", "Donchian screener", "Ichimoku screener"])
+    tab_need, tab_scr0, tab_ich0, tab_chat0 = st.tabs(["Score & regime", "Donchian screener", "Ichimoku screener", "Chat"])
     with tab_need:
         st.info("Point the sidebar at the folder with your CSVs (or upload them). The option history and option chain "
                 "files are required; the others refine the score, regime and charts and are used when present.")
@@ -145,6 +146,8 @@ if "history" not in data or "chain" not in data:
         screener_tab.render(show_vega)
     with tab_ich0:
         ichimoku_tab.render(show_vega)
+    with tab_chat0:                     # no option data yet: the chat only knows about any screener results
+        chat_tab.render(None)
     st.stop()
 
 weights = {"price": float(w_price), "flow": float(w_flow), "dex": float(w_dex)}
@@ -217,8 +220,9 @@ def trend_card_ui(title, main_text, main_note, tc, kind):
 
 
 # ------------------------------------------------------------------ tabs
-tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt, tab_scr, tab_ich = st.tabs(
-    ["Score & regime", "Strategies", "Dealer map", "Flow", "Volatility", "Backtest", "Donchian screener", "Ichimoku screener"])
+tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt, tab_scr, tab_ich, tab_chat = st.tabs(
+    ["Score & regime", "Strategies", "Dealer map", "Flow", "Volatility", "Backtest", "Donchian screener",
+     "Ichimoku screener", "Chat"])
 
 with tab_over:
     c1, c2, c3, c4 = st.columns(4)
@@ -548,3 +552,6 @@ with tab_scr:
 
 with tab_ich:
     ichimoku_tab.render(show_vega)
+
+with tab_chat:
+    chat_tab.render(R)

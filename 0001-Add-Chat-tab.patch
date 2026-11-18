@@ -1,0 +1,533 @@
+From 9de04124cc9ae8489eb0c293616ca45713adcede Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 17 Nov 2026 21:54:53 -0500
+Subject: [PATCH] Add Chat tab: ask Claude about the app's current readings
+
+New chat_tab.py builds a text snapshot of the current app state (score,
+regime, strategies, OI summary, screener results) and streams answers from
+the Anthropic API. Wired into app.py as the last tab (also available before
+option files are loaded). Adds anthropic to requirements.txt, a README
+section and test_chat_tab.py.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011aDvGR8oZs4avwVSx33HWn
+---
+ README.md        |   9 ++
+ app.py           |  13 ++-
+ chat_tab.py      | 275 +++++++++++++++++++++++++++++++++++++++++++++++
+ requirements.txt |   2 +
+ test_chat_tab.py | 142 ++++++++++++++++++++++++
+ 5 files changed, 438 insertions(+), 3 deletions(-)
+ create mode 100644 chat_tab.py
+ create mode 100644 test_chat_tab.py
+
+diff --git a/README.md b/README.md
+index b2b2b31..023f262 100644
+--- a/README.md
++++ b/README.md
+@@ -45,5 +45,14 @@ Files: `screener_tab.py` (UI) and `donchian_screener.py` (logic, also runnable a
+ Needs `yfinance` and `lxml` (see requirements.txt) and internet access from wherever the app runs.
+ Tests: `python3 test_screener_tab.py` (tab, stand-in Streamlit) and `python3 test_screener.py` (screener logic).
+ 
++## Chat tab
++Last tab ("Chat"); it also appears before any option files are loaded. Ask Claude about what the app is showing: why a
++strategy was ranked or blocked, what the gamma regime / flip / walls / OI tags mean, how to read the screener grades.
++It receives a text snapshot of the current state (scores, regime, strategies, OI summary, latest screener results), not
++your raw CSV files; the "What the chatbot can see" expander shows exactly what is sent.
++Needs the `anthropic` package (in requirements.txt) and an API key. On Streamlit Cloud add it under Manage app -> Settings ->
++Secrets as `ANTHROPIC_API_KEY = "sk-ant-..."` (optional `CHAT_MODEL = "..."`); locally set the same environment variable,
++or paste the key into the tab (kept only for that browser session). Files: `chat_tab.py`; test: `python3 test_chat_tab.py`.
++
+ ## Link
+ https://dealerpositioningbacktest-vydwrk6jfuj4ysbptutjxa.streamlit.app/
+diff --git a/app.py b/app.py
+index 1830abf..9449874 100644
+--- a/app.py
++++ b/app.py
+@@ -13,6 +13,7 @@ import streamlit as st
+ import core
+ import screener_tab
+ import ichimoku_tab
++import chat_tab
+ 
+ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
+ 
+@@ -137,7 +138,7 @@ for c, (k, label) in zip(cols, KIND_LABELS.items()):
+     c.caption(("OK  " if k in data else "missing  ") + label)
+ 
+ if "history" not in data or "chain" not in data:
+-    tab_need, tab_scr0, tab_ich0 = st.tabs(["Score & regime", "Donchian screener", "Ichimoku screener"])
++    tab_need, tab_scr0, tab_ich0, tab_chat0 = st.tabs(["Score & regime", "Donchian screener", "Ichimoku screener", "Chat"])
+     with tab_need:
+         st.info("Point the sidebar at the folder with your CSVs (or upload them). The option history and option chain "
+                 "files are required; the others refine the score, regime and charts and are used when present.")
+@@ -145,6 +146,8 @@ if "history" not in data or "chain" not in data:
+         screener_tab.render(show_vega)
+     with tab_ich0:
+         ichimoku_tab.render(show_vega)
++    with tab_chat0:                     # no option data yet: the chat only knows about any screener results
++        chat_tab.render(None)
+     st.stop()
+ 
+ weights = {"price": float(w_price), "flow": float(w_flow), "dex": float(w_dex)}
+@@ -217,8 +220,9 @@ def trend_card_ui(title, main_text, main_note, tc, kind):
+ 
+ 
+ # ------------------------------------------------------------------ tabs
+-tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt, tab_scr, tab_ich = st.tabs(
+-    ["Score & regime", "Strategies", "Dealer map", "Flow", "Volatility", "Backtest", "Donchian screener", "Ichimoku screener"])
++tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt, tab_scr, tab_ich, tab_chat = st.tabs(
++    ["Score & regime", "Strategies", "Dealer map", "Flow", "Volatility", "Backtest", "Donchian screener",
++     "Ichimoku screener", "Chat"])
+ 
+ with tab_over:
+     c1, c2, c3, c4 = st.columns(4)
+@@ -548,3 +552,6 @@ with tab_scr:
+ 
+ with tab_ich:
+     ichimoku_tab.render(show_vega)
++
++with tab_chat:
++    chat_tab.render(R)
+diff --git a/chat_tab.py b/chat_tab.py
+new file mode 100644
+index 0000000..92928d9
+--- /dev/null
++++ b/chat_tab.py
+@@ -0,0 +1,275 @@
++"""Streamlit tab: chat with Claude about what the app is currently showing.
++Self-contained like screener_tab.py: needs only the `anthropic` package and an API key. It works before the option
++files are loaded (it then just knows about the screeners). Call render(R) inside a tab, where R is core.analyse() output
++or None.  build_context() is pure (no Streamlit) so it can be tested on its own."""
++import math
++import os
++
++import numpy as np
++import pandas as pd
++import streamlit as st
++
++DEFAULT_MODEL = "claude-sonnet-5-5"
++MAX_TURNS_SENT = 20          # most recent chat messages sent to the API (older ones stay on screen only)
++MAX_TOKENS = 1500
++SCREENER_COLS = ["ticker", "setup", "side", "grade", "bars_ago", "date", "close", "level", "dist_atr",
++                 "stop", "adx", "atr_pct", "note"]
++
++SYSTEM_PROMPT = """You are the assistant built into a Streamlit research app called "Regime & Strategy Selector". \
++The app scores QQQ option data (price structure, flow, DEX), gates on IV rank and term structure, picks a gamma \
++regime, and proposes option structures. It also has Donchian and Ichimoku stock screeners.
++
++Rules:
++- Ground every number in the APP STATE block below. If a figure is not there, say it is not in the current view \
++instead of guessing or using memory. Never invent prices, strikes or levels.
++- Explain what the app is showing and why: what a reading means, why a strategy was ranked or blocked, what the gates \
++and gamma regime imply, how to interpret OI build/erode tags, flip levels, walls, and screener grades.
++- Be concise and plain. Use short paragraphs or a few bullets; skip preamble.
++- GEX, DEX, walls and multi-expiry P&L are model estimates; POP is a lognormal estimate; the 19-month backtest found \
++the composite direction score unreliable on its own. Mention these limits when they matter to the answer.
++- This is a research tool. Do not give personalised financial advice or tell the user to place a trade; frame answers \
++as how the signals read and what the trade-offs are.
++- If the user asks how to change a setting, point to the sidebar control or tab by name."""
++
++
++def _fnum(x, nd=2, plus=False):
++    try:
++        x = float(x)
++    except (TypeError, ValueError):
++        return "n/a"
++    if math.isnan(x):
++        return "n/a"
++    return f"{x:+,.{nd}f}" if plus else f"{x:,.{nd}f}"
++
++
++def _big(x):
++    try:
++        x = float(x)
++    except (TypeError, ValueError):
++        return "n/a"
++    if math.isnan(x):
++        return "n/a"
++    return f"{x / 1e9:+.2f}B" if abs(x) >= 1e9 else f"{x / 1e6:+,.0f}M"
++
++
++def _section(lines, title, fn):
++    """Run one context section; a failure in one section must never break the chat."""
++    try:
++        out = fn()
++    except Exception as e:  # noqa: BLE001
++        out = [f"(unavailable: {type(e).__name__})"]
++    if out:
++        lines.append(f"## {title}")
++        lines.extend(out)
++
++
++def _direction(R):
++    d, comps = R["direction"], R["components"]
++    out = [f"Sentiment band: {d['band']} (composite score {_fnum(d['score'], 2, True)}, -1..+1)."]
++    for k in ("price", "flow", "dex"):
++        out.append(f"- {k}: score {_fnum(comps.get(k), 3, True)}, weight used {_fnum(d['used'].get(k, 0.0))}")
++    out.append(f"Flow source: {R.get('flow_source')}. Component agreement with composite sign: "
++               f"{_fnum(d.get('agreement'), 2)}.")
++    return out
++
++
++def _regime(R):
++    g = R["regime"]
++    out = [f"Effective gamma regime: {g['effective']}{' (inside near-flip buffer)' if g.get('near_flip') else ''}.",
++           f"Net GEX over the trade window: {_big(g.get('net'))} (source: {g.get('source')}).",
++           f"Spot (parity-implied from the chain): {_fnum(R['spot'])}. Data as of {pd.Timestamp(R['asof']).date()}."]
++    if not _isnan(g.get("flip")):
++        out.append(f"Gamma-weighted flip across trade-window expiries: {_fnum(g['flip'], 1)} "
++                   f"(range {_fnum(g.get('flip_min'), 0)} to {_fnum(g.get('flip_max'), 0)}).")
++    af = R.get("agg_flip")
++    if af and not _isnan(af.get("flip")):
++        side = "below" if R["spot"] < af["flip"] else "above"
++        out.append(f"All-expiry GEX-profile flip: {_fnum(af['flip'], 1)}; spot is {side} it "
++                   f"({_fnum(abs(R['spot'] - af['flip']), 1)} pts). GEX profile at spot: {_big(af.get('value_at_spot'))} "
++                   f"({af.get('state_at_spot')} gamma zone).")
++    w = R.get("walls")
++    if w:
++        out.append(f"Put wall {_fnum(w['put_wall'], 0)}, call wall {_fnum(w['call_wall'], 0)} (largest GEX within 7% of spot).")
++    for name, key in (("GEX", "gex_trend"), ("DEX", "dex_trend")):
++        tc = R.get(key)
++        if tc:
++            out.append(f"{name} trend: {tc['sign']}, {tc['trend']}; value {_big(tc.get('value'))}, "
++                       f"{tc['short']}d change {_big(tc['d_short'])}, {tc['long']}d change {_big(tc['d_long'])}, "
++                       f"{_fnum(tc.get('pctile', float('nan')) * 100, 0)}th percentile of last 120 days, "
++                       f"{tc.get('days_in_sign')} sessions in this sign.")
++    return out
++
++
++def _vol(R):
++    e = R["edge"]
++    return [f"IV rank: {_fnum(R['ivrank'], 0) if R['ivrank'] is not None else 'n/a'}.",
++            f"Front IV {_fnum(e['front_iv'] * 100, 1)}% ({e['front_dte']} DTE), back IV {_fnum(e['back_iv'] * 100, 1)}% "
++            f"({e['back_dte']} DTE), front minus back {_fnum(e['edge_pts'], 1, True)} vol pts."]
++
++
++def _flow(R):
++    f = R["flow"]
++    return [f"Aggressor imbalance {_fnum(f.get('aggr'), 2, True)}; unusual-activity imbalance (2+ DTE) "
++            f"{_fnum(f.get('unusual'), 2, True)}; premium at mid {_fnum(f.get('mid_share', float('nan')) * 100, 0)}% "
++            "(high mid share = flow is weak evidence)."]
++
++
++def _oi(R):
++    oi = R.get("oi")
++    if oi is None:
++        return ["No usable oi_chg column in the chain, so OI changes are unavailable."]
++    s = oi["summary"]
++    out = [f"Window: expiries {s['min_dte']}-{s['max_dte']} DTE within {s['band']:.0%} of spot (versus previous session).",
++           f"Net call OI change {_fnum(s['net_call_chg'], 0, True)} (adds {_fnum(s['call_adds'], 0)}, cuts {_fnum(s['call_cuts'], 0)}); "
++           f"net put OI change {_fnum(s['net_put_chg'], 0, True)} (adds {_fnum(s['put_adds'], 0)}, cuts {_fnum(s['put_cuts'], 0)}).",
++           f"Put share of OI adds {_fnum(s['put_add_share'] * 100, 0)}%; one-day turnover {_fnum(s['gross_turnover'] * 100, 0)}%; "
++           f"{_fnum(s['known_share'] * 100, 0)}% of OI has a change figure. Display only: never in the score."]
++    for t in R.get("oi_walls") or []:
++        if t.get("available"):
++            out.append(f"{t['label']} {_fnum(t['strike'], 0)}: {t['tag']} ({t['side']} OI {_fnum(t['oi'], 0)}, "
++                       f"change {_fnum(t['chg'], 0, True)}).")
++    return out
++
++
++def _strategies(R):
++    out = []
++    if R.get("stay_out"):
++        out.append("STAY OUT: every candidate failed a gate (IV edge / IV rank).")
++    out.append(f"Matrix cell: {R['direction']['band']} / {R['regime']['effective']} gamma. Prices are natural fills; "
++               "P&L is per 1 contract; multi-expiry structures are Black-Scholes with flat chain IV (model-based).")
++    asof = pd.Timestamp(R["asof"])
++    for i, s in enumerate(R["strategies"], 1):
++        legs = "; ".join(f"{'Buy' if l.qty > 0 else 'Sell'} {abs(l.qty)} {pd.Timestamp(l.exp).date()} "
++                         f"({(pd.Timestamp(l.exp) - asof).days} DTE) {_fnum(l.strike, 0)}{l.cp} "
++                         f"bid {_fnum(l.bid)} ask {_fnum(l.ask)} IV {_fnum(l.iv * 100, 1)}%" for l in s.legs)
++        be = ", ".join(_fnum(b) for b in s.breakevens) or "n/a"
++        out.append(f"{i}. {s.name} [{'eligible' if s.eligible else 'NOT ELIGIBLE'}] ({s.source}). Legs: {legs}. "
++                   f"Net debit {_fnum(s.debit_nat, 2, True)} (negative = credit), max profit {_fnum(s.max_profit, 0)} USD, "
++                   f"max loss {_fnum(s.max_loss, 0)} USD{' (model)' if s.model_based else ''}, breakevens {be}, "
++                   f"approx POP {_fnum(s.pop * 100, 0)}%.")
++        if s.reason:
++            out.append(f"   Why not eligible: {s.reason}")
++        for wmsg in s.warnings:
++            out.append(f"   Note: {wmsg}")
++    return out
++
++
++def _isnan(x):
++    try:
++        return x is None or math.isnan(float(x))
++    except (TypeError, ValueError):
++        return True
++
++
++def _screener(res, when, label, max_rows=40):
++    if res is None:
++        return None
++    if res.empty:
++        return [f"{label} (run {when or 'earlier'}): no setups at the latest bar."]
++    cols = [c for c in SCREENER_COLS if c in res.columns]
++    shown = res[cols].head(max_rows)
++    counts = res["setup"].value_counts().to_dict() if "setup" in res.columns else {}
++    body = shown.to_csv(index=False, float_format="%.2f")
++    more = f"\n(showing first {max_rows} of {len(res)} rows)" if len(res) > max_rows else ""
++    return [f"{label} (run {when or 'earlier'}): {len(res)} setups; counts by setup {counts}.", body + more]
++
++
++def build_context(R=None, scr_res=None, scr_when=None, ich_res=None, ich_when=None) -> str:
++    """Plain-text snapshot of what the app is currently showing. Each section degrades independently."""
++    lines = ["# APP STATE (what the user is currently looking at)"]
++    if R is None:
++        lines.append("Option files are not loaded yet, so there is no QQQ score, regime or strategy data.")
++    else:
++        _section(lines, "Direction", lambda: _direction(R))
++        _section(lines, "Gamma regime, flip, walls, dealer trends", lambda: _regime(R))
++        _section(lines, "Volatility gates", lambda: _vol(R))
++        _section(lines, "Flow", lambda: _flow(R))
++        _section(lines, "Open-interest change", lambda: _oi(R))
++        _section(lines, "Ranked strategies", lambda: _strategies(R))
++    for res, when, label in ((scr_res, scr_when, "Donchian screener"), (ich_res, ich_when, "Ichimoku screener")):
++        _section(lines, label, lambda res=res, when=when, label=label: _screener(res, when, label))
++    return "\n".join(lines)
++
++
++# ------------------------------------------------------------------ Streamlit UI
++def _secret(name):
++    try:
++        v = st.secrets.get(name)
++    except Exception:  # no secrets file configured
++        v = None
++    return v or os.environ.get(name)
++
++
++def _client(api_key):
++    import anthropic
++    return anthropic.Anthropic(api_key=api_key)
++
++
++def _trim(msgs, n=MAX_TURNS_SENT):
++    """Last n messages, starting on a user turn (the API requires the first message to be from the user)."""
++    out = list(msgs[-n:])
++    while out and out[0]["role"] != "user":
++        out.pop(0)
++    return out
++
++
++def _stream_reply(client, model, system, history):
++    """Yield text chunks for st.write_stream."""
++    with client.messages.stream(model=model, max_tokens=MAX_TOKENS, system=system, messages=history) as stream:
++        for text in stream.text_stream:
++            yield text
++
++
++def render(R=None):
++    st.subheader("Ask about this app")
++    st.caption("Chat with Claude about the readings, strategies and screener results currently on screen. It sees a text "
++               "snapshot of the app's state (not your raw CSV files). Research tool, not financial advice.")
++    try:
++        import anthropic  # noqa: F401
++    except ImportError:
++        st.error("The chat needs the `anthropic` package. Add `anthropic>=0.40` to requirements.txt and reboot the app.")
++        return
++
++    api_key = _secret("ANTHROPIC_API_KEY")
++    model = _secret("CHAT_MODEL") or DEFAULT_MODEL
++    if not api_key:
++        api_key = st.text_input("Anthropic API key", type="password", key="chat_api_key",
++                                help="Kept only in this browser session. To avoid pasting it each time, add "
++                                     "ANTHROPIC_API_KEY to Streamlit secrets (Manage app -> Settings -> Secrets).")
++        if not api_key:
++            st.info("Enter an Anthropic API key to start chatting.")
++            return
++
++    context = build_context(R, st.session_state.get("scr_res"), st.session_state.get("scr_when"),
++                            st.session_state.get("ich_res"), st.session_state.get("ich_when"))
++    system = SYSTEM_PROMPT + "\n\n" + context
++
++    msgs = st.session_state.setdefault("chat_msgs", [])
++    top = st.columns([4, 1])
++    top[0].caption(f"Model: {model}")
++    if top[1].button("Clear chat", key="chat_clear"):
++        msgs.clear()
++    with st.expander("What the chatbot can see"):
++        st.code(context, language="text")
++
++    for m in msgs:
++        with st.chat_message(m["role"]):
++            st.markdown(m["content"])
++    if not msgs:
++        st.caption("Try: \"Why is the top strategy ranked first?\"  |  \"What does the near-flip buffer mean right now?\"  |  "
++                   "\"Summarise the Donchian hits by grade.\"")
++
++    prompt = st.chat_input("Ask about the regime, a strategy, or the screeners...", key="chat_input")
++    if not prompt:
++        return
++    msgs.append({"role": "user", "content": prompt})
++    with st.chat_message("user"):
++        st.markdown(prompt)
++    with st.chat_message("assistant"):
++        try:
++            reply = st.write_stream(_stream_reply(_client(api_key), model, system, _trim(msgs)))
++        except Exception as e:  # noqa: BLE001
++            msgs.pop()   # drop the unanswered question so the history keeps alternating user/assistant
++            st.error(f"The chat request failed: {e}")
++            return
++    msgs.append({"role": "assistant", "content": reply})
+diff --git a/requirements.txt b/requirements.txt
+index 9d9fcec..2012c17 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,3 +5,5 @@ numpy>=1.24
+ yfinance>=0.2.40
+ lxml>=4.9
+ requests>=2.28
++# Chat tab (Claude API)
++anthropic>=0.40
+diff --git a/test_chat_tab.py b/test_chat_tab.py
+new file mode 100644
+index 0000000..68d64d3
+--- /dev/null
++++ b/test_chat_tab.py
+@@ -0,0 +1,142 @@
++"""Tests for chat_tab.py using a stand-in `streamlit` and a fake Anthropic client (neither real package is needed).
++Run:  python3 test_chat_tab.py"""
++import os, sys, types
++from types import SimpleNamespace as NS
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import numpy as np, pandas as pd
++
++LOG = {"errors": [], "infos": [], "texts": [], "code": [], "chat": []}
++OV = {}
++class Ctx:
++    def __enter__(self): return self
++    def __exit__(self, *a): return False
++    def __getattr__(self, n): return getattr(st, n)
++st = types.ModuleType("streamlit")
++st.session_state = {}
++st.secrets = {}
++for n in ("subheader", "caption", "write", "markdown"):
++    setattr(st, n, lambda *a, **k: LOG["texts"].append(str(a[0]) if a else ""))
++st.error = lambda m, *a, **k: LOG["errors"].append(str(m))
++st.info = lambda m, *a, **k: LOG["infos"].append(str(m))
++st.code = lambda m, *a, **k: LOG["code"].append(str(m))
++st.columns = lambda spec, *a, **k: [Ctx() for _ in range(spec if isinstance(spec, int) else len(spec))]
++st.expander = lambda *a, **k: Ctx()
++st.chat_message = lambda role: Ctx()
++st.text_input = lambda label, **k: OV.get(k["key"], "")
++st.button = lambda label, **k: OV.get(k["key"], False)
++st.chat_input = lambda label, **k: OV.get(k["key"])
++st.write_stream = lambda gen: "".join(gen)
++sys.modules["streamlit"] = st
++
++CALLS = []
++class FakeStream:
++    def __init__(self, kw): self.kw = kw
++    def __enter__(self): return self
++    def __exit__(self, *a): return False
++    @property
++    def text_stream(self): return iter(["Hello ", "there."])
++class FakeClient:
++    def __init__(self, api_key): self.api_key = api_key; self.messages = self
++    def stream(self, **kw): CALLS.append(kw); return FakeStream(kw)
++anth = types.ModuleType("anthropic"); anth.Anthropic = FakeClient
++sys.modules["anthropic"] = anth
++
++import chat_tab as ct
++
++fails = 0
++def check(name, cond):
++    global fails
++    print(("PASS " if cond else "FAIL ") + name)
++    fails += 0 if cond else 1
++
++# ---- a minimal stand-in for core.analyse() output
++leg = NS(qty=1, exp=pd.Timestamp("2026-12-04"), cp="P", strike=600.0, bid=5.1, ask=5.3, iv=0.21)
++leg2 = NS(qty=-1, exp=pd.Timestamp("2026-11-27"), cp="P", strike=590.0, bid=3.0, ask=3.2, iv=0.23)
++strat = NS(name="Put calendar", eligible=True, source="matrix", legs=[leg, leg2], debit_nat=1.2, max_profit=300.0,
++           max_loss=120.0, model_based=True, breakevens=[585.5, 596.0], pop=0.41, reason="", warnings=["Flat IV assumed"])
++blocked = NS(name="Iron condor", eligible=False, source="adjacent", legs=[leg], debit_nat=-2.0, max_profit=200.0,
++             max_loss=800.0, model_based=False, breakevens=[], pop=0.6, reason="Front-back IV edge below threshold", warnings=[])
++R = {"asof": pd.Timestamp("2026-11-16"), "spot": 598.4,
++     "direction": {"band": "Mild bullish", "score": 0.14, "used": {"price": 0.6, "flow": 0.25, "dex": 0.15}, "agreement": 0.67},
++     "components": {"price": 0.3, "flow": -0.1, "dex": float("nan")}, "flow_source": "history put/call proxy",
++     "regime": {"effective": "Negative", "near_flip": True, "net": -1.2e9, "source": "expiration file", "flip": 597.0,
++                "flip_min": 590.0, "flip_max": 604.0},
++     "agg_flip": {"flip": 600.0, "value_at_spot": -2.0e8, "state_at_spot": "negative"},
++     "walls": {"put_wall": 590.0, "call_wall": 610.0},
++     "gex_trend": {"sign": "Negative", "trend": "strengthening", "value": -1.2e9, "short": 5, "long": 20, "d_short": -3e8,
++                   "d_long": -5e8, "pctile": 0.12, "days_in_sign": 4},
++     "dex_trend": None,
++     "edge": {"front_iv": 0.22, "back_iv": 0.20, "front_dte": 10, "back_dte": 45, "edge_pts": 2.0}, "ivrank": 31.7,
++     "flow": {"aggr": 0.12, "unusual": float("nan"), "mid_share": 0.55},
++     "oi": None, "oi_walls": [], "stay_out": False, "strategies": [strat, blocked]}
++
++ctx = ct.build_context(R)
++check("context has direction band", "Mild bullish" in ctx and "+0.14" in ctx)
++check("nan component rendered as n/a, not 'nan'", "dex: score n/a" in ctx and "nan" not in ctx.lower().replace("unavailable", ""))
++check("near-flip noted", "inside near-flip buffer" in ctx)
++check("flip side computed (spot below flip)", "spot is below it" in ctx)
++check("walls present", "Put wall 590" in ctx and "call wall 610" in ctx)
++check("strategy legs and numbers present", "Put calendar" in ctx and "Buy 1 2026-12-04" in ctx and "max loss 120" in ctx)
++check("blocked strategy shows reason", "NOT ELIGIBLE" in ctx and "edge below threshold" in ctx)
++check("missing OI handled", "OI changes are unavailable" in ctx)
++check("None dex_trend skipped silently", "DEX trend" not in ctx)
++
++bad = dict(R); bad["edge"] = {}
++ctx_bad = ct.build_context(bad)
++check("one broken section does not break the rest", "(unavailable: KeyError)" in ctx_bad and "Put calendar" in ctx_bad)
++
++ctx_none = ct.build_context(None)
++check("no-data context says files not loaded", "not loaded yet" in ctx_none and "Ranked strategies" not in ctx_none)
++
++scr = pd.DataFrame({"ticker": ["AAPL", "NVDA"], "setup": ["breakout", "pullback"], "side": ["long", "long"], "grade": ["A", "B"],
++                    "close": [230.123, 140.5], "extra_col": [1, 2]})
++ctx_s = ct.build_context(None, scr_res=scr, scr_when="2026-11-17 09:00")
++check("screener rows included, extra columns dropped", "AAPL" in ctx_s and "230.12" in ctx_s and "extra_col" not in ctx_s)
++check("empty screener result noted", "no setups" in ct.build_context(None, scr_res=scr.iloc[0:0], scr_when="x"))
++big = pd.concat([scr] * 30, ignore_index=True)
++check("long screener result is truncated", "showing first 40 of 60" in ct.build_context(None, scr_res=big))
++
++# ---- history trimming
++m = [{"role": "assistant" if i % 2 == 0 else "user", "content": str(i)} for i in range(30)]
++t = ct._trim(m)
++check("trim keeps <= 20 and starts on user", len(t) <= 20 and t[0]["role"] == "user")
++
++# ---- render flows
++st.session_state.clear(); LOG.update({k: [] for k in LOG})
++ct.render(R)
++check("no key -> asks for key, no crash", any("API key" in s for s in LOG["infos"]))
++
++st.session_state.clear(); LOG.update({k: [] for k in LOG}); CALLS.clear()
++os.environ["ANTHROPIC_API_KEY"] = "sk-test"
++OV["chat_input"] = "Why is the first strategy ranked first?"
++ct.render(R)
++check("one API call made", len(CALLS) == 1)
++kw = CALLS[0] if CALLS else {}
++check("model default used", kw.get("model") == "claude-sonnet-5-5")
++check("system prompt carries app state", "Put calendar" in kw.get("system", "") and "APP STATE" in kw.get("system", ""))
++check("first message is the user's question", kw.get("messages", [{}])[0] == {"role": "user", "content": OV["chat_input"]})
++check("reply stored in history", st.session_state["chat_msgs"][-1] == {"role": "assistant", "content": "Hello there."})
++
++# second turn appends and alternates
++OV["chat_input"] = "And the second one?"
++ct.render(R)
++roles = [x["role"] for x in CALLS[-1]["messages"]]
++check("second call sends alternating history", roles == ["user", "assistant", "user"])
++
++# API failure drops the unanswered question
++class Boom(FakeClient):
++    def stream(self, **kw): raise RuntimeError("rate limited")
++anth.Anthropic = Boom
++n_before = len(st.session_state["chat_msgs"])
++OV["chat_input"] = "third"
++ct.render(R)
++check("failure shown and history unchanged", any("rate limited" in e for e in LOG["errors"]) and len(st.session_state["chat_msgs"]) == n_before)
++
++# clear button
++anth.Anthropic = FakeClient
++OV["chat_input"] = None; OV["chat_clear"] = True
++ct.render(R)
++check("clear chat empties history", st.session_state["chat_msgs"] == [])
++
++print("\nALL PASSED" if not fails else f"\n{fails} FAILED")
++sys.exit(1 if fails else 0)
+-- 
+2.43.0
+
