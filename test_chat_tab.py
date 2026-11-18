@@ -81,6 +81,42 @@ check("blocked strategy shows reason", "NOT ELIGIBLE" in ctx and "edge below thr
 check("missing OI handled", "OI changes are unavailable" in ctx)
 check("None dex_trend skipped silently", "DEX trend" not in ctx)
 
+# ---- per-expiry / strike / OI detail (the Dealer map tables)
+gx = pd.DataFrame({"date": pd.to_datetime(["2026-11-18", "2026-11-19", "2026-11-20"]),
+                   "expiration": ["Nov 18, 2026", "Nov 19, 2026", "Nov 20, 2026"],
+                   "net_gex": [-756663090.3, -250432698.73, -8984374659.68], "gamma_flip": [746.48, 747.29, 761.93],
+                   "call_wall": [745, 740, 750], "put_wall": [718, 740, 764]})
+dx = pd.DataFrame({"expiration": ["Nov 18, 2026", "Nov 19, 2026", "Nov 20, 2026"],
+                   "net_dex": [-3094725644.87, -1722427907.16, -35897280976.64]})
+oi_ = {"summary": {"min_dte": 1, "max_dte": 45, "band": 0.08, "net_call_chg": 1200.0, "call_adds": 3000.0, "call_cuts": 1800.0,
+                   "net_put_chg": -500.0, "put_adds": 900.0, "put_cuts": 1400.0, "put_add_share": 0.23,
+                   "gross_turnover": 0.04, "known_share": 0.9},
+       "by_exp": pd.DataFrame({"exp": pd.to_datetime(["2026-11-18"]), "dte": [1], "call_oi": [9000.0], "call_chg": [800.0],
+                               "call_tag": ["build"], "put_oi": [7000.0], "put_chg": [-100.0], "put_tag": ["flat"],
+                               "d_gex": [2.5e6], "note": [""]}),
+       "by_strike": pd.DataFrame({"strike": [600.0, 605.0], "call_oi": [5000.0, 100.0], "call_chg": [900.0, 0.0],
+                                  "call_pct": [0.2, 0.0], "call_tag": ["build", "flat"], "put_oi": [100.0, 100.0],
+                                  "put_chg": [0.0, 0.0], "put_pct": [0.0, 0.0], "put_tag": ["flat", "flat"],
+                                  "d_gex": [1e6, 0.0]}),
+       "top": pd.DataFrame({"exp": pd.to_datetime(["2026-11-18"]), "dte": [1], "cp": ["C"], "strike": [600.0],
+                            "open_interest": [5000.0], "chg": [900.0], "pct": [0.2], "tag": ["build"], "d_gex": [1e6]})}
+R_full = dict(R, gex_exp=gx, dex_exp_df=dx, oi=oi_, oi_walls=[],
+              walls={"put_wall": 590.0, "call_wall": 610.0, "table": pd.DataFrame({"strike": [590.0, 600.0], "net": [-4e8, 2e8]})},
+              ivtab=pd.DataFrame({"dte": [1, 10, 45], "atm_iv": [0.25, 0.22, 0.20]}),
+              em=pd.DataFrame({"date": pd.to_datetime(["2026-11-18"]), "expected_move_amt": [4.1],
+                               "expected_move_percentage": [0.7], "lower_price": [594.3], "upper_price": [602.5]}))
+cf = ct.build_context(R_full)
+check("per-expiry table includes Nov 18 with its GEX (-756.66M)", "Nov 18 2026,2,-756.66" in cf)
+check("per-expiry DEX included", "-3094.73" in cf)
+check("Nov 20 row present too", "Nov 20 2026,4,-8984.37" in cf)
+check("expiry flip and walls included", "746.48" in cf and "745" in cf and "718" in cf)
+check("GEX by strike included", "Net GEX by strike" in cf and "590.00,-400.00" in cf)
+check("OI by expiration / strike / contract included", "OI change by expiration" in cf and "build" in cf
+      and "Largest single-contract OI changes" in cf)
+check("term structure and expected move included", "ATM implied vol term structure" in cf and "594.30" in cf)
+check("no unavailable sections with full data", "(unavailable" not in cf)
+check("missing expiration file explained, not silent", "no per-expiry GEX breakdown" in ct.build_context(dict(R_full, gex_exp=None)))
+
 bad = dict(R); bad["edge"] = {}
 ctx_bad = ct.build_context(bad)
 check("one broken section does not break the rest", "(unavailable: KeyError)" in ctx_bad and "Put calendar" in ctx_bad)

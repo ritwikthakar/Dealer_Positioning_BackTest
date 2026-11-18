@@ -21,7 +21,10 @@ regime, and proposes option structures. It also has Donchian and Ichimoku stock 
 
 Rules:
 - Ground every number in the APP STATE block below. If a figure is not there, say it is not in the current view \
-instead of guessing or using memory. Never invent prices, strikes or levels.
+instead of guessing or using memory. Never invent prices, strikes or levels. Before saying something is missing, check \
+every section: per-expiry GEX/DEX, GEX by strike, OI change tables, IV term structure and expected moves are all included.
+- Not included: the raw CSV files, the largest-flow-prints table, the Backtest tab tables and the price chart history. \
+If asked about those, say they are not in what you were given.
 - Explain what the app is showing and why: what a reading means, why a strategy was ranked or blocked, what the gates \
 and gamma regime imply, how to interpret OI build/erode tags, flip levels, walls, and screener grades.
 - Be concise and plain. Use short paragraphs or a few bullets; skip preamble.
@@ -174,6 +177,85 @@ def _screener(res, when, label, max_rows=40):
     return [f"{label} (run {when or 'earlier'}): {len(res)} setups; counts by setup {counts}.", body + more]
 
 
+def _csv(df, cols, max_rows):
+    """Compact CSV of the chosen columns, with a truncation note."""
+    cols = [c for c in cols if c in df.columns]
+    body = df[cols].head(max_rows).to_csv(index=False, float_format="%.2f")
+    more = f"\n(showing first {max_rows} of {len(df)} rows)" if len(df) > max_rows else ""
+    return body.rstrip("\n") + more
+
+
+def _by_expiration(R):
+    """The 'Net GEX / DEX by expiration' table on the Dealer map tab, one row per expiry (first 90 days)."""
+    g = R.get("gex_exp")
+    if g is None:
+        return ["No GEX-by-expiration file loaded, so there is no per-expiry GEX breakdown."]
+    asof = pd.Timestamp(R["asof"])
+    t = g.copy()
+    t["DTE"] = (t["date"] - asof).dt.days
+    t = t[(t["DTE"] >= 0) & (t["DTE"] <= 90)]
+    if R.get("dex_exp_df") is not None:
+        t = t.merge(R["dex_exp_df"][["expiration", "net_dex"]], on="expiration", how="left")
+    t["expiration"] = pd.to_datetime(t["date"]).dt.strftime("%b %d %Y")
+    for c in ("net_gex", "net_dex"):           # millions of dollars keeps the numbers short and readable
+        if c in t.columns:
+            t[c + "_$M"] = t[c] / 1e6
+    return ["One row per expiry, first 90 DTE (this is the app's 'Net GEX / DEX by expiration' table). "
+            "Values in millions of dollars per 1% move; gamma_flip, call_wall and put_wall are QQQ price levels.",
+            _csv(t, ["expiration", "DTE", "net_gex_$M", "net_dex_$M", "gamma_flip", "call_wall", "put_wall"], 45)]
+
+
+def _strike_gex(R):
+    w = R.get("walls")
+    if not w or w.get("table") is None:
+        return None
+    t = w["table"].copy()
+    t["net_gex_$M"] = t["net"] / 1e6
+    return ["Net GEX by strike within +/-7% of spot, millions of dollars (model estimate).",
+            _csv(t.sort_values("strike"), ["strike", "net_gex_$M"], 45)]
+
+
+def _oi_detail(R):
+    oi = R.get("oi")
+    if oi is None:
+        return None
+    out = []
+    be = oi["by_exp"].copy()
+    be["expiry"] = be["exp"].dt.date.astype(str)
+    be["d_gex_$M"] = be["d_gex"] / 1e6
+    out += ["OI change by expiration (vs previous session):",
+            _csv(be, ["expiry", "dte", "call_oi", "call_chg", "call_tag", "put_oi", "put_chg", "put_tag", "d_gex_$M"], 30)]
+    bs = oi["by_strike"].copy()
+    moved = (~bs["call_tag"].isin(["flat", "n/a"])) | (~bs["put_tag"].isin(["flat", "n/a"]))
+    bs = bs[moved].copy()
+    bs["d_gex_$M"] = bs["d_gex"] / 1e6
+    out += ["OI change by strike, only strikes tagged build/erode:",
+            _csv(bs, ["strike", "call_oi", "call_chg", "call_tag", "put_oi", "put_chg", "put_tag", "d_gex_$M"], 25)
+            if len(bs) else "(no strike clears the thresholds)"]
+    tp = oi["top"].copy()
+    tp["expiry"] = tp["exp"].dt.date.astype(str)
+    tp["d_gex_$M"] = tp["d_gex"] / 1e6
+    out += ["Largest single-contract OI changes:",
+            _csv(tp, ["expiry", "dte", "cp", "strike", "open_interest", "chg", "tag", "d_gex_$M"], 10)]
+    return out
+
+
+def _term_and_em(R):
+    out = []
+    it = R["ivtab"][R["ivtab"]["dte"] >= 1].copy()
+    it["atm_iv_pct"] = it["atm_iv"] * 100
+    out += ["ATM implied vol term structure:", _csv(it, ["dte", "atm_iv_pct"], 30)]
+    em = R.get("em")
+    if em is not None:
+        e = em.copy()
+        e["DTE"] = (e["date"] - pd.Timestamp(R["asof"])).dt.days
+        e["date"] = e["date"].dt.date.astype(str)
+        out += ["Expected move by expiry:",
+                _csv(e[(e["DTE"] >= 0) & (e["DTE"] <= 60)],
+                     ["date", "DTE", "expected_move_amt", "expected_move_percentage", "lower_price", "upper_price"], 20)]
+    return out
+
+
 def build_context(R=None, scr_res=None, scr_when=None, ich_res=None, ich_when=None) -> str:
     """Plain-text snapshot of what the app is currently showing. Each section degrades independently."""
     lines = ["# APP STATE (what the user is currently looking at)"]
@@ -185,6 +267,10 @@ def build_context(R=None, scr_res=None, scr_when=None, ich_res=None, ich_when=No
         _section(lines, "Volatility gates", lambda: _vol(R))
         _section(lines, "Flow", lambda: _flow(R))
         _section(lines, "Open-interest change", lambda: _oi(R))
+        _section(lines, "GEX / DEX by expiration (per-expiry breakdown)", lambda: _by_expiration(R))
+        _section(lines, "GEX by strike", lambda: _strike_gex(R))
+        _section(lines, "Open-interest change detail", lambda: _oi_detail(R))
+        _section(lines, "IV term structure and expected move", lambda: _term_and_em(R))
         _section(lines, "Ranked strategies", lambda: _strategies(R))
     for res, when, label in ((scr_res, scr_when, "Donchian screener"), (ich_res, ich_when, "Ichimoku screener")):
         _section(lines, label, lambda res=res, when=when, label=label: _screener(res, when, label))
