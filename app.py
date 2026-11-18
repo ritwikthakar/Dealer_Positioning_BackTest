@@ -19,7 +19,7 @@ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
 # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
 # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
-EXPECTED_CORE = "2026-11-05.3"
+EXPECTED_CORE = "2026-11-17.1"
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
     core = importlib.reload(core)
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
@@ -500,9 +500,15 @@ with tab_flow:
     c3.metric("Premium at mid (low confidence)", "n/a" if np.isnan(f["mid_share"]) else f"{f['mid_share']:.0%}")
     st.caption("A large mid-price share means most prints cannot be classified as buyer- or seller-initiated; "
                "treat flow as weak evidence.")
+    for kind_key, label in (("flow", "Options flow"), ("unusual", "Unusual activity")):
+        raw = data.get(kind_key)
+        if raw is not None and core.underlying_rows(raw).empty:      # say why the numbers above are n/a
+            seen = (raw["Symbol"].astype(str).value_counts().head(8).to_dict() if "Symbol" in raw.columns else {})
+            st.warning(f"{label}: the file loaded ({len(raw)} rows) but none are for QQQ, so nothing here can be "
+                       f"scored. Symbols found: {seen or 'no Symbol column'}. Export the file from the QQQ page "
+                       "(or filter it to QQQ) and reload it.")
     if "flow" in data:
-        fl = data["flow"]
-        fl = fl[fl["Symbol"] == "QQQ"].copy()
+        fl = core.underlying_rows(data["flow"])
         fl["Premium"] = pd.to_numeric(fl["Premium"], errors="coerce")
         st.subheader("Largest prints")
         st.dataframe(fl.sort_values("Premium", ascending=False).head(25)[

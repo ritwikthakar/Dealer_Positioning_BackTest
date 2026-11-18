@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-CORE_VERSION = "2026-11-05.3"   # app.py refuses to run against a core.py with a different stamp
+CORE_VERSION = "2026-11-17.1"   # app.py refuses to run against a core.py with a different stamp
 
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
@@ -279,13 +279,22 @@ def term_edge(ivtab: pd.DataFrame, front_dte: int = 10, back_dte: int = 45) -> d
 
 
 # --------------------------------------------------------------------------- flow / dex / regime
+def underlying_rows(df: pd.DataFrame, symbol: str = "QQQ") -> pd.DataFrame:
+    """Rows of a flow / unusual-activity export for one underlying. Tolerates case, stray spaces and a leading '$'
+    ('qqq', 'QQQ ', '$QQQ'); an exact match silently returned nothing for those and every flow number became n/a."""
+    if "Symbol" not in df.columns:
+        return df.copy()
+    s = df["Symbol"].astype(str).str.strip().str.upper().str.lstrip("$")
+    return df[s == symbol.upper()].copy()
+
+
 def flow_live(flow: pd.DataFrame | None, unusual: pd.DataFrame | None, min_dte: int = 1,
               contrarian: bool = False) -> dict:
     out = {"score": np.nan, "aggr": np.nan, "unusual": np.nan, "mid_share": np.nan,
            "bull_prem": np.nan, "bear_prem": np.nan, "mid_prem": np.nan}
     parts = []
     if flow is not None:
-        f = flow[flow["Symbol"] == "QQQ"].copy()
+        f = underlying_rows(flow)
         f["Premium"] = pd.to_numeric(f["Premium"], errors="coerce")
         f["DTE"] = pd.to_numeric(f["DTE"], errors="coerce")
         f = f[(f["Premium"] > 0) & (f["DTE"] >= min_dte)]
@@ -299,7 +308,7 @@ def flow_live(flow: pd.DataFrame | None, unusual: pd.DataFrame | None, min_dte: 
             out["aggr"] = (bull - bear) / (bull + bear)
             parts.append((0.6, float(clip(2 * out["aggr"]))))
     if unusual is not None:
-        u = unusual[unusual["Symbol"] == "QQQ"].copy()
+        u = underlying_rows(unusual)
         for col in ["Volume", "Latest", "DTE"]:
             u[col] = pd.to_numeric(u[col].astype(str).str.replace(",", ""), errors="coerce")
         u = u[u["DTE"] >= max(min_dte, 2)]
