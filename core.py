@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-CORE_VERSION = "2026-11-17.1"   # app.py refuses to run against a core.py with a different stamp
+CORE_VERSION = "2026-11-17.2"   # app.py refuses to run against a core.py with a different stamp
 
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
@@ -279,22 +279,44 @@ def term_edge(ivtab: pd.DataFrame, front_dte: int = 10, back_dte: int = 45) -> d
 
 
 # --------------------------------------------------------------------------- flow / dex / regime
-def underlying_rows(df: pd.DataFrame, symbol: str = "QQQ") -> pd.DataFrame:
-    """Rows of a flow / unusual-activity export for one underlying. Tolerates case, stray spaces and a leading '$'
-    ('qqq', 'QQQ ', '$QQQ'); an exact match silently returned nothing for those and every flow number became n/a."""
+_TICKER = re.compile(r"^[A-Z0-9.\-^=]{1,10}$")
+
+
+def _symbols(df: pd.DataFrame) -> pd.Series:
+    """Clean Symbol column: stripped, upper-cased, no leading '$'. Anything that is not a ticker (for example the
+    'Downloaded from Barchart.com as of ...' footer line Barchart appends to its exports) becomes empty."""
+    if "Symbol" not in df.columns:
+        return pd.Series("", index=df.index)
+    s = df["Symbol"].astype(str).str.strip().str.upper().str.lstrip("$")
+    return s.where(s.map(lambda x: bool(_TICKER.match(x))), "")
+
+
+def detect_symbol(*dfs) -> str:
+    """Most common ticker across the flow / unusual-activity exports ('' if none)."""
+    counts = pd.Series(dtype=int)
+    for df in dfs:
+        if df is not None:
+            counts = counts.add(_symbols(df).value_counts().drop("", errors="ignore"), fill_value=0)
+    return str(counts.idxmax()) if len(counts) else ""
+
+
+def underlying_rows(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
+    """Rows of a flow / unusual-activity export for one underlying (default: the file's own most common ticker).
+    Tolerates case, stray spaces and a leading '$', and drops Barchart's footer line."""
     if "Symbol" not in df.columns:
         return df.copy()
-    s = df["Symbol"].astype(str).str.strip().str.upper().str.lstrip("$")
-    return df[s == symbol.upper()].copy()
+    want = (symbol or detect_symbol(df)).strip().upper().lstrip("$")
+    return df[_symbols(df) == want].copy() if want else df.iloc[0:0].copy()
 
 
 def flow_live(flow: pd.DataFrame | None, unusual: pd.DataFrame | None, min_dte: int = 1,
-              contrarian: bool = False) -> dict:
+              contrarian: bool = False, symbol: str | None = None) -> dict:
     out = {"score": np.nan, "aggr": np.nan, "unusual": np.nan, "mid_share": np.nan,
            "bull_prem": np.nan, "bear_prem": np.nan, "mid_prem": np.nan}
     parts = []
+    symbol = (symbol or detect_symbol(flow, unusual)) or None
     if flow is not None:
-        f = underlying_rows(flow)
+        f = underlying_rows(flow, symbol)
         f["Premium"] = pd.to_numeric(f["Premium"], errors="coerce")
         f["DTE"] = pd.to_numeric(f["DTE"], errors="coerce")
         f = f[(f["Premium"] > 0) & (f["DTE"] >= min_dte)]
@@ -308,7 +330,7 @@ def flow_live(flow: pd.DataFrame | None, unusual: pd.DataFrame | None, min_dte: 
             out["aggr"] = (bull - bear) / (bull + bear)
             parts.append((0.6, float(clip(2 * out["aggr"]))))
     if unusual is not None:
-        u = underlying_rows(unusual)
+        u = underlying_rows(unusual, symbol)
         for col in ["Volume", "Latest", "DTE"]:
             u[col] = pd.to_numeric(u[col].astype(str).str.replace(",", ""), errors="coerce")
         u = u[u["DTE"] >= max(min_dte, 2)]
@@ -1126,8 +1148,9 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
     gs = data["gex_strike"].copy() if "gex_strike" in data else None
     ivtab = atm_iv_table(chain, spot, asof)
     edge = term_edge(ivtab)
+    flow_symbol = (opts.get("flow_symbol") or detect_symbol(data.get("flow"), data.get("unusual"))).upper()
     fl = flow_live(data.get("flow"), data.get("unusual"), opts.get("flow_min_dte", 1),
-                   opts.get("flow_contrarian", False))
+                   opts.get("flow_contrarian", False), symbol=flow_symbol)
     dexs = dex_exp_score(dex_exp, asof)
     dex_parts = [v for v in (last["dex"], dexs) if not np.isnan(v)]
     dex_score = float(np.mean(dex_parts)) if dex_parts else np.nan
@@ -1174,7 +1197,7 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
             "agg_flip": profile_flip(gs, spot),
             "gex_trend": gex_trend, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
             "candle_mode": candle_mode, "hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
-            "flow": fl, "flow_source": flow_source, "dex_hist": float(last["dex"]), "dex_exp": dexs,
+            "flow": fl, "flow_symbol": flow_symbol, "flow_source": flow_source, "dex_hist": float(last["dex"]), "dex_exp": dexs,
             "ivrank": ivr, "edge": edge, "ivtab": ivtab, "walls": walls, "em": em, "gex_exp": gex_exp,
             "dex_exp_df": dex_exp, "strategies": strategies, "builder": builder,
             "stay_out": not any(s.eligible for s in strategies)}

@@ -19,7 +19,7 @@ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
 # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
 # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
-EXPECTED_CORE = "2026-11-17.1"
+EXPECTED_CORE = "2026-11-17.2"
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
     core = importlib.reload(core)
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
@@ -87,6 +87,9 @@ with st.sidebar:
     folder = st.text_input("Folder with the CSV files", value=os.environ.get("QQQ_DATA_DIR", ""), key="folder",
                            help="Files are recognised by their columns, so file names don't matter.")
     uploads = st.file_uploader("...or upload the CSVs", type=["csv"], accept_multiple_files=True, key="uploads")
+    flow_sym = st.text_input("Flow / unusual-activity symbol", value="", key="flow_symbol",
+                             help="Leave blank to use the most common ticker in those files. Set it (for example QQQ) "
+                                  "if a file mixes several underlyings. It should match the underlying of your chain files.")
     st.caption("Optional: add a daily QQQ OHLC export (TradingView, Yahoo or Barchart) for true candlesticks.")
 
     st.header("Direction weights")
@@ -164,6 +167,7 @@ opts = {
                   "diag_gap": int(diag_gap)},
     "oi_build_pct": float(oi_build) / 100.0, "oi_strong_pct": float(oi_strong) / 100.0,
     "oi_min_contracts": float(oi_min), "oi_band": float(oi_band) / 100.0,
+    "flow_symbol": flow_sym.strip(),
 }
 
 try:
@@ -500,15 +504,21 @@ with tab_flow:
     c3.metric("Premium at mid (low confidence)", "n/a" if np.isnan(f["mid_share"]) else f"{f['mid_share']:.0%}")
     st.caption("A large mid-price share means most prints cannot be classified as buyer- or seller-initiated; "
                "treat flow as weak evidence.")
+    fsym = R["flow_symbol"]
+    if "flow" in data or "unusual" in data:
+        st.caption(f"Flow and unusual activity are scored for **{fsym or 'n/a'}** "
+                   f"({'set in the sidebar' if flow_sym.strip() else 'detected from the files'}). "
+                   "Make sure this is the same underlying as your option chain and history files.")
     for kind_key, label in (("flow", "Options flow"), ("unusual", "Unusual activity")):
         raw = data.get(kind_key)
-        if raw is not None and core.underlying_rows(raw).empty:      # say why the numbers above are n/a
-            seen = (raw["Symbol"].astype(str).value_counts().head(8).to_dict() if "Symbol" in raw.columns else {})
-            st.warning(f"{label}: the file loaded ({len(raw)} rows) but none are for QQQ, so nothing here can be "
-                       f"scored. Symbols found: {seen or 'no Symbol column'}. Export the file from the QQQ page "
-                       "(or filter it to QQQ) and reload it.")
+        if raw is not None and core.underlying_rows(raw, fsym).empty:      # say why the numbers above are n/a
+            clean = core._symbols(raw)
+            seen = clean[clean != ""].value_counts().head(8).to_dict() if "Symbol" in raw.columns else {}
+            st.warning(f"{label}: no rows for {fsym or 'any ticker'} in this file ({len(raw)} rows loaded). "
+                       f"Symbols found: {seen or 'no Symbol column'}. Clear or change the sidebar symbol, or "
+                       "re-export the file for the right underlying.")
     if "flow" in data:
-        fl = core.underlying_rows(data["flow"])
+        fl = core.underlying_rows(data["flow"], fsym)
         fl["Premium"] = pd.to_numeric(fl["Premium"], errors="coerce")
         st.subheader("Largest prints")
         st.dataframe(fl.sort_values("Premium", ascending=False).head(25)[

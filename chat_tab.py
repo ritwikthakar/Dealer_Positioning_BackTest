@@ -112,7 +112,10 @@ def _vol(R):
 
 def _flow(R):
     f = R["flow"]
-    return [f"Aggressor imbalance {_fnum(f.get('aggr'), 2, True)}; unusual-activity imbalance (2+ DTE) "
+    sym = R.get("flow_symbol")
+    return [f"Flow and unusual activity are scored for {sym or 'n/a'} (the underlying in those files; "
+            "it should match the option chain's underlying).",
+            f"Aggressor imbalance {_fnum(f.get('aggr'), 2, True)}; unusual-activity imbalance (2+ DTE) "
             f"{_fnum(f.get('unusual'), 2, True)}; premium at mid {_fnum(f.get('mid_share', float('nan')) * 100, 0)}% "
             "(high mid share = flow is weak evidence)."]
 
