@@ -1,0 +1,495 @@
+From b465091ece1d9ba0e2da5baad93d09b141136b04 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 22:38:42 -0500
+Subject: [PATCH 1/2] Fix S&P 500 loader: wrap HTML in StringIO for pandas
+ read_html
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011aDvGQem6MteBRiPAGZdRT
+---
+ donchian_screener.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/donchian_screener.py b/donchian_screener.py
+index 8de6ed9..6396964 100644
+--- a/donchian_screener.py
++++ b/donchian_screener.py
+@@ -192,7 +192,8 @@ def get_sp500_tickers():
+     r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                      headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+     r.raise_for_status()
+-    for tbl in pd.read_html(r.text):
++    from io import StringIO
++    for tbl in pd.read_html(StringIO(r.text)):
+         cols = [str(x).lower().strip() for x in tbl.columns]
+         if "symbol" in cols:
+             s = tbl.iloc[:, cols.index("symbol")].astype(str).str.strip().str.replace(".", "-", regex=False)
+-- 
+2.43.0
+
+
+From 5e392daef80e1311140ccaaf790924163762f903 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 23:04:32 -0500
+Subject: [PATCH 2/2] Add Gamma screener tab (yfinance option chains, net GEX,
+ zero-gamma flip, walls)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011aDvGQem6MteBRiPAGZdRT
+---
+ app.py                 |  12 ++-
+ gamma_screener.py      | 170 +++++++++++++++++++++++++++++++++++++++++
+ gamma_tab.py           | 120 +++++++++++++++++++++++++++++
+ test_gamma_screener.py |  85 +++++++++++++++++++++
+ 4 files changed, 384 insertions(+), 3 deletions(-)
+ create mode 100644 gamma_screener.py
+ create mode 100644 gamma_tab.py
+ create mode 100644 test_gamma_screener.py
+
+diff --git a/app.py b/app.py
+index 4a0c504..9bc36ea 100644
+--- a/app.py
++++ b/app.py
+@@ -13,6 +13,7 @@ import streamlit as st
+ import core
+ import screener_tab
+ import ichimoku_tab
++import gamma_tab
+ import chat_tab
+ 
+ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
+@@ -141,7 +142,7 @@ for c, (k, label) in zip(cols, KIND_LABELS.items()):
+     c.caption(("OK  " if k in data else "missing  ") + label)
+ 
+ if "history" not in data or "chain" not in data:
+-    tab_need, tab_scr0, tab_ich0, tab_chat0 = st.tabs(["Score & regime", "Donchian screener", "Ichimoku screener", "Chat"])
++    tab_need, tab_scr0, tab_ich0, tab_gam0, tab_chat0 = st.tabs(["Score & regime", "Donchian screener", "Ichimoku screener", "Gamma screener", "Chat"])
+     with tab_need:
+         st.info("Point the sidebar at the folder with your CSVs (or upload them). The option history and option chain "
+                 "files are required; the others refine the score, regime and charts and are used when present.")
+@@ -149,6 +150,8 @@ if "history" not in data or "chain" not in data:
+         screener_tab.render(show_vega)
+     with tab_ich0:
+         ichimoku_tab.render(show_vega)
++    with tab_gam0:
++        gamma_tab.render()
+     with tab_chat0:                     # no option data yet: the chat only knows about any screener results
+         chat_tab.render(None)
+     st.stop()
+@@ -224,9 +227,9 @@ def trend_card_ui(title, main_text, main_note, tc, kind):
+ 
+ 
+ # ------------------------------------------------------------------ tabs
+-tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt, tab_scr, tab_ich, tab_chat = st.tabs(
++tab_over, tab_strat, tab_dealer, tab_flow, tab_vol, tab_bt, tab_scr, tab_ich, tab_gam, tab_chat = st.tabs(
+     ["Score & regime", "Strategies", "Dealer map", "Flow", "Volatility", "Backtest", "Donchian screener",
+-     "Ichimoku screener", "Chat"])
++     "Ichimoku screener", "Gamma screener", "Chat"])
+ 
+ with tab_over:
+     c1, c2, c3, c4 = st.columns(4)
+@@ -569,5 +572,8 @@ with tab_scr:
+ with tab_ich:
+     ichimoku_tab.render(show_vega)
+ 
++with tab_gam:
++    gamma_tab.render()
++
+ with tab_chat:
+     chat_tab.render(R)
+diff --git a/gamma_screener.py b/gamma_screener.py
+new file mode 100644
+index 0000000..7b529e1
+--- /dev/null
++++ b/gamma_screener.py
+@@ -0,0 +1,170 @@
++"""Gamma (GEX) screener using free yfinance option chains. numpy/pandas only (no scipy).
++
++Per ticker: net dealer GEX in $ per 1% move, GEX as % of 20-day average dollar volume (so names are comparable),
++zero-gamma flip level, distance from spot to the flip, and the largest call / put gamma walls.
++
++Convention (the usual, and a weak assumption on single stocks): dealers are long calls and short puts, so call GEX
++is positive and put GEX negative.  GEX per contract = gamma * OI * 100 * spot^2 * 0.01.
++yfinance open interest is end-of-day and its IVs can be stale or zero, so strikes are filtered (see load_chain).
++"""
++import datetime as dt
++import math
++from concurrent.futures import ThreadPoolExecutor
++
++import numpy as np
++import pandas as pd
++
++# Liquid optionable names: a sensible default so a scan takes ~1 minute instead of pulling 500 chains.
++LIQUID = ("SPY QQQ IWM DIA TLT GLD SLV XLF XLE XLK XLV XLY XLP XLI XLU SMH ARKK "
++          "AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO AMD NFLX ORCL CRM ADBE INTC MU QCOM CSCO IBM "
++          "JPM BAC WFC GS MS C V MA PYPL COF AXP "
++          "XOM CVX COP OXY SLB LLY UNH JNJ PFE MRK ABBV AMGN "
++          "WMT COST HD LOW TGT NKE MCD SBUX KO PEP DIS "
++          "BA CAT GE F GM UBER SHOP PLTR COIN SOFI RIVN ABNB SNOW CRWD PANW NOW").split()
++
++_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
++
++
++def bs_gamma(spot, strike, t_years, iv):
++    """Black-Scholes gamma (same for calls and puts), vectorised, zero rates/dividends."""
++    spot = np.asarray(spot, float)
++    strike = np.asarray(strike, float)
++    t = np.maximum(np.asarray(t_years, float), 0.5 / 365.0)
++    iv = np.maximum(np.asarray(iv, float), 1e-4)
++    sd = iv * np.sqrt(t)
++    d1 = (np.log(spot / strike) + 0.5 * sd * sd) / sd
++    return _INV_SQRT_2PI * np.exp(-0.5 * d1 * d1) / (spot * sd)
++
++
++def clean_chain(chain, spot, min_oi=1, band=0.30, iv_lo=0.03, iv_hi=3.0):
++    """Keep strikes within +/-band of spot, real OI, and sane IV (yfinance returns ~0 IV for stale quotes)."""
++    c = chain.copy()
++    c = c[(c["oi"] >= min_oi) & c["iv"].between(iv_lo, iv_hi) & c["strike"].between(spot * (1 - band), spot * (1 + band))]
++    return c.reset_index(drop=True)
++
++
++def gex_at(chain, s):
++    """Net dealer GEX ($ per 1% move) if spot were `s`, holding IV and OI fixed."""
++    if chain.empty:
++        return 0.0
++    g = bs_gamma(s, chain["strike"].to_numpy(), chain["dte"].to_numpy() / 365.0, chain["iv"].to_numpy())
++    sign = np.where(chain["cp"].to_numpy() == "C", 1.0, -1.0)
++    return float(np.sum(g * chain["oi"].to_numpy() * 100.0 * s * s * 0.01 * sign))
++
++
++def strike_table(chain, spot):
++    """Per-strike call / put / net GEX at the current spot."""
++    g = bs_gamma(spot, chain["strike"].to_numpy(), chain["dte"].to_numpy() / 365.0, chain["iv"].to_numpy())
++    val = g * chain["oi"].to_numpy() * 100.0 * spot * spot * 0.01
++    x = chain.assign(gex=np.where(chain["cp"] == "C", val, -val))
++    piv = x.pivot_table(index="strike", columns="cp", values="gex", aggfunc="sum", fill_value=0.0)
++    for k in ("C", "P"):
++        if k not in piv:
++            piv[k] = 0.0
++    out = pd.DataFrame({"call": piv["C"], "put": piv["P"]})
++    out["net"] = out["call"] + out["put"]
++    return out.reset_index()
++
++
++def zero_gamma(chain, spot, span=0.15, n=61):
++    """Spot level where net GEX changes sign, nearest to spot, searched within +/-span. None if no crossing."""
++    grid = np.linspace(spot * (1 - span), spot * (1 + span), n)
++    vals = np.array([gex_at(chain, s) for s in grid])
++    cross = np.where(np.sign(vals[:-1]) * np.sign(vals[1:]) < 0)[0]
++    if len(cross) == 0:
++        return None
++    best = None
++    for i in cross:
++        x0, x1, y0, y1 = grid[i], grid[i + 1], vals[i], vals[i + 1]
++        x = x0 - y0 * (x1 - x0) / (y1 - y0)
++        if best is None or abs(x - spot) < abs(best - spot):
++            best = x
++    return float(best)
++
++
++def regime_label(net, dist_flip_pct, near=1.5):
++    if net < 0:
++        return "Negative"
++    if dist_flip_pct is not None and abs(dist_flip_pct) <= near:
++        return "Near flip"
++    return "Positive"
++
++
++def scan_chain(ticker, spot, chain, adv_dollar=None, min_oi=1):
++    """One result row (and the strike table) from a raw chain frame: columns strike, cp, oi, iv, dte, volume."""
++    c = clean_chain(chain, spot, min_oi=min_oi)
++    if c.empty:
++        raise ValueError("no usable option rows (OI/IV filters removed everything)")
++    st_ = strike_table(c, spot)
++    net = float(st_["net"].sum())
++    flip = zero_gamma(c, spot)
++    dist = None if flip is None else 100.0 * (spot - flip) / spot
++    calls, puts = st_.loc[st_["call"].idxmax()], st_.loc[st_["put"].idxmin()]
++    row = {
++        "ticker": ticker, "spot": round(spot, 2), "regime": regime_label(net, dist),
++        "net_gex_m": round(net / 1e6, 2),
++        "gex_pct_adv": None if not adv_dollar else round(100.0 * net / adv_dollar, 3),
++        "flip": None if flip is None else round(flip, 2),
++        "spot_vs_flip_pct": None if dist is None else round(dist, 2),
++        "call_wall": float(calls["strike"]), "put_wall": float(puts["strike"]),
++        "total_oi": int(c["oi"].sum()), "put_call_oi": round(float(c.loc[c.cp == "P", "oi"].sum()) / max(float(c.loc[c.cp == "C", "oi"].sum()), 1.0), 2),
++        "n_expiries": int(c["dte"].nunique()),
++    }
++    return row, st_
++
++
++def yf_chain(ticker, max_dte=45, today=None):
++    """(spot, avg dollar volume, raw chain) from yfinance. Raises on no data."""
++    import yfinance as yf
++    today = today or dt.date.today()
++    tk = yf.Ticker(ticker)
++    hist = tk.history(period="2mo", auto_adjust=False)
++    if hist is None or hist.empty:
++        raise ValueError("no price history")
++    spot = float(hist["Close"].iloc[-1])
++    adv = float((hist["Close"] * hist["Volume"]).tail(20).mean())
++    frames = []
++    for e in tk.options or []:
++        dte = (dt.date.fromisoformat(e) - today).days
++        if dte < 0 or dte > max_dte:
++            continue
++        oc = tk.option_chain(e)
++        for cp, df in (("C", oc.calls), ("P", oc.puts)):
++            if df is None or df.empty:
++                continue
++            frames.append(pd.DataFrame({
++                "strike": df["strike"].astype(float), "cp": cp,
++                "oi": pd.to_numeric(df["openInterest"], errors="coerce").fillna(0.0),
++                "iv": pd.to_numeric(df["impliedVolatility"], errors="coerce").fillna(0.0),
++                "volume": pd.to_numeric(df["volume"], errors="coerce").fillna(0.0), "dte": dte}))
++    if not frames:
++        raise ValueError("no options in the DTE window")
++    return spot, adv, pd.concat(frames, ignore_index=True)
++
++
++def run(tickers, max_dte=45, min_oi=1, loader=None, progress=None, workers=6):
++    """Scan tickers. Returns (results DataFrame sorted by gex_pct_adv ascending, {ticker: strike table}, {ticker: error})."""
++    loader = loader or yf_chain
++    rows, strikes, failed = [], {}, {}
++
++    def one(t):
++        spot, adv, chain = loader(t, max_dte)
++        return scan_chain(t, spot, chain, adv, min_oi)
++
++    done = 0
++    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
++        futs = {t: ex.submit(one, t) for t in tickers}
++        for t, f in futs.items():
++            try:
++                row, st_ = f.result()
++                rows.append(row)
++                strikes[t] = st_
++            except Exception as e:
++                failed[t] = str(e)[:120]
++            done += 1
++            if progress:
++                progress(done, len(tickers))
++    df = pd.DataFrame(rows)
++    if not df.empty:
++        df = df.sort_values("gex_pct_adv", na_position="last").reset_index(drop=True)
++    return df, strikes, failed
+diff --git a/gamma_tab.py b/gamma_tab.py
+new file mode 100644
+index 0000000..c48f659
+--- /dev/null
++++ b/gamma_tab.py
+@@ -0,0 +1,120 @@
++"""Streamlit tab: gamma (GEX) screener on free yfinance option chains. Needs gamma_screener.py next to it.
++Self-contained like screener_tab.py (no option CSVs needed). Call render() inside a tab."""
++import datetime as dt
++
++import pandas as pd
++import streamlit as st
++
++import screener_tab as dtab  # parse_tickers and the cached S&P 500 list
++
++SHOW = ["ticker", "regime", "spot", "net_gex_m", "gex_pct_adv", "flip", "spot_vs_flip_pct",
++        "call_wall", "put_wall", "put_call_oi", "total_oi", "n_expiries"]
++
++
++def render():
++    try:
++        import gamma_screener as gs
++    except ImportError:
++        st.error("gamma_screener.py is missing. Copy it into the same folder as app.py and reboot the app.")
++        return
++
++    st.subheader("Gamma screener")
++    st.caption("Net dealer gamma exposure from Yahoo Finance option chains (end-of-day open interest). Calls count positive, "
++               "puts negative. gex_pct_adv = net GEX per 1% move as % of 20-day average dollar volume, so names compare. "
++               "Most negative first. Candidate list for review, not trade signals.")
++    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
++    universe = c1.radio("Universe", ["Liquid list", "S&P 500", "My tickers"], horizontal=True, key="gam_universe")
++    max_dte = c2.number_input("Max DTE", 7, 120, 45, key="gam_dte", help="Only expiries within this many days.")
++    cap = c3.number_input("Max tickers", 10, 500, 100, key="gam_cap", help="Caps the S&P 500 scan (each ticker is several Yahoo calls).")
++    c4.write("")
++    run_it = c4.button("Run screener", key="gam_run")
++    custom = ""
++    if universe == "My tickers":
++        custom = st.text_area("Tickers (comma, space or newline separated)", value="SPY, QQQ, NVDA, TSLA", key="gam_tickers")
++
++    if run_it:
++        try:
++            if universe == "Liquid list":
++                tickers = list(gs.LIQUID)
++            elif universe == "S&P 500":
++                tickers = dtab._sp500()[:int(cap)]
++            else:
++                tickers = dtab.parse_tickers(custom)
++        except Exception as e:
++            st.error(f"Could not load the S&P 500 list ({e}). Use 'Liquid list' or 'My tickers' instead.")
++            tickers = []
++        if not tickers:
++            st.warning("No tickers to scan.")
++        else:
++            bar = st.progress(0.0, text="Downloading option chains...")
++
++            def cb(done, total):
++                bar.progress(min(done / max(total, 1), 1.0), text=f"{done}/{total} tickers")
++
++            try:
++                res, strikes, failed = gs.run(tickers, max_dte=int(max_dte), progress=cb)
++                st.session_state.update(gam_res=res, gam_strikes=strikes, gam_failed=failed,
++                                        gam_when=dt.datetime.now().strftime("%Y-%m-%d %H:%M"))
++            except ImportError as e:
++                st.error(f"Missing package: {e}. Add yfinance to requirements.txt and reboot the app.")
++            except Exception as e:
++                st.error(f"Screener failed: {e}")
++            bar.empty()
++
++    res = st.session_state.get("gam_res")
++    if res is None:
++        st.info("Choose a universe and press Run screener. The liquid list (~90 names) takes about a minute.")
++        _notes()
++        return
++    failed = st.session_state.get("gam_failed", {})
++    st.caption(f"Scanned at {st.session_state.get('gam_when', '')} | usable: {len(res)} | failed: {len(failed)}")
++    if failed:
++        st.caption("Failed: " + ", ".join(f"{k} ({v})" for k, v in list(failed.items())[:8]) + (" ..." if len(failed) > 8 else ""))
++    if res.empty:
++        st.info("No usable chains returned.")
++        _notes()
++        return
++
++    counts = res["regime"].value_counts()
++    cols = st.columns(3)
++    for col, k in zip(cols, ("Negative", "Near flip", "Positive")):
++        col.metric(k, int(counts.get(k, 0)))
++
++    f1, f2, f3 = st.columns(3)
++    pick = f1.multiselect("Regime", ["Negative", "Near flip", "Positive"], default=["Negative", "Near flip"], key="gam_f_reg")
++    min_oi = f2.number_input("Min total OI", 0, 10_000_000, 5000, key="gam_f_oi")
++    max_pct = f3.number_input("Max gex_pct_adv", -1000.0, 1000.0, 1000.0, key="gam_f_pct",
++                              help="e.g. 0 keeps only names with negative normalized GEX.")
++    view = res[res["regime"].isin(pick) & (res["total_oi"] >= int(min_oi))
++               & (res["gex_pct_adv"].fillna(1e9) <= float(max_pct))]
++    if view.empty:
++        st.info("Nothing matches these filters.")
++        _notes()
++        return
++    st.dataframe(view[SHOW], hide_index=True)
++    st.download_button("Download CSV", view[SHOW].to_csv(index=False).encode("utf-8"),
++                       file_name="gamma_screen.csv", mime="text/csv", key="gam_dl")
++    st.caption("net_gex_m = $ millions per 1% move. spot_vs_flip_pct > 0 means spot is above the zero-gamma flip. "
++               "Walls are the strikes with the largest call / put gamma.")
++
++    st.subheader("Strike detail")
++    choice = st.selectbox("Ticker", list(view["ticker"]), key="gam_pick")
++    row = view[view["ticker"] == choice].iloc[0]
++    tbl = st.session_state.get("gam_strikes", {}).get(choice)
++    if tbl is not None and not tbl.empty:
++        near = tbl[(tbl["strike"] >= row["spot"] * 0.85) & (tbl["strike"] <= row["spot"] * 1.15)]
++        st.bar_chart((near.set_index("strike")[["call", "put"]] / 1e6), height=300)
++        flip = "none within +/-15%" if pd.isna(row["flip"]) else f"{row['flip']:.2f}"
++        st.caption(f"{choice}: spot {row['spot']:.2f}, flip {flip}, call wall {row['call_wall']:.2f}, put wall "
++                   f"{row['put_wall']:.2f}. Bars are $M GEX per 1% move by strike (calls up, puts down).")
++    _notes()
++
++
++def _notes():
++    with st.expander("How this is computed and what to trust"):
++        st.markdown("**Method.** GEX per strike = Black-Scholes gamma x open interest x 100 x spot^2 x 0.01, calls positive, "
++                    "puts negative. The flip is where net GEX crosses zero when spot is moved +/-15% with IV and OI held fixed. "
++                    "Strikes beyond +/-30% of spot, zero-OI rows and IVs outside 3%-300% are dropped.")
++        st.markdown("**Caveats.** Open interest is end-of-day; the dealers-long-calls/short-puts assumption is weak on single "
++                    "stocks (better on SPY/QQQ); Yahoo IVs can be stale outside market hours; 0DTE and index options "
++                    "carry most gamma on SPX, which Yahoo does not cover well. Use it to shortlist names, then check the strike detail.")
+diff --git a/test_gamma_screener.py b/test_gamma_screener.py
+new file mode 100644
+index 0000000..222f8f6
+--- /dev/null
++++ b/test_gamma_screener.py
+@@ -0,0 +1,85 @@
++"""Tests for gamma_screener.py and gamma_tab.py (stand-in streamlit, fake chain loader; no network)."""
++import os, sys, types
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++import numpy as np, pandas as pd
++import gamma_screener as gs
++
++# ---- gamma sanity: ATM gamma ~ 1/(S*sigma*sqrt(T)) * 0.3989, symmetric in log-moneyness
++g = gs.bs_gamma(100, 100, 30 / 365, 0.2)
++assert abs(g - 0.3989 / (100 * 0.2 * np.sqrt(30 / 365))) / g < 0.02
++assert gs.bs_gamma(100, 150, 30 / 365, 0.2) < g * 1e-3
++
++def chain(call_oi, put_oi, spot=100.0):
++    rows = []
++    for k in range(80, 121, 2):
++        for dte in (5, 20):
++            rows.append((k, "C", call_oi * (1 if k >= spot else 0.4), 0.25, dte, 100))
++            rows.append((k, "P", put_oi * (1 if k <= spot else 0.4), 0.25, dte, 100))
++    return pd.DataFrame(rows, columns=["strike", "cp", "oi", "iv", "dte", "volume"])
++
++# ---- signs: call-heavy positive, put-heavy negative
++r1, t1 = gs.scan_chain("POS", 100.0, chain(5000, 500), 5e9)
++r2, t2 = gs.scan_chain("NEG", 100.0, chain(500, 5000), 5e9)
++assert r1["net_gex_m"] > 0 and r1["regime"] in ("Positive", "Near flip")
++assert r2["net_gex_m"] < 0 and r2["regime"] == "Negative" and r2["gex_pct_adv"] < 0
++assert abs(t1["net"].sum() / 1e6 - r1["net_gex_m"]) < 0.01
++assert r1["call_wall"] >= 100 and r2["put_wall"] <= 100
++
++# ---- flip: puts below, calls above gives a crossing near spot when OI is balanced across the sides
++c = chain(3000, 3000)
++f = gs.zero_gamma(gs.clean_chain(c, 100.0), 100.0)
++assert f is None or 85 <= f <= 115
++
++# ---- filters: zero IV and zero OI rows are dropped; all-bad chain raises
++bad = chain(1000, 1000); bad["iv"] = 0.0
++try: gs.scan_chain("X", 100.0, bad); raise SystemExit("expected ValueError")
++except ValueError: pass
++
++# ---- run(): failures isolated, sorted most negative first
++def loader(t, max_dte):
++    if t == "BOOM": raise RuntimeError("no data")
++    return 100.0, 5e9, chain(500, 5000) if t == "NEG" else chain(5000, 500)
++res, strikes, failed = gs.run(["POS", "NEG", "BOOM"], loader=loader, workers=2)
++assert list(res["ticker"]) == ["NEG", "POS"] and "BOOM" in failed and set(strikes) == {"POS", "NEG"}
++print("gamma_screener ok")
++
++# ---- tab with stand-in streamlit
++LOG = {"errors": [], "infos": [], "frames": [], "charts": 0, "metrics": {}}
++OV = {}
++class Ctx:
++    def __enter__(self): return self
++    def __exit__(self, *a): return False
++    def __getattr__(self, n): return getattr(st, n)
++st = types.ModuleType("streamlit"); st.session_state = {}
++st.cache_data = lambda *a, **k: (a[0] if a and callable(a[0]) else (lambda f: f))
++for n in ("subheader", "caption", "write", "markdown"): setattr(st, n, lambda *a, **k: None)
++st.error = lambda m, *a, **k: LOG["errors"].append(str(m)); st.warning = lambda *a, **k: None
++st.info = lambda m, *a, **k: LOG["infos"].append(str(m))
++st.columns = lambda n, *a, **k: [Ctx() for _ in range(n if isinstance(n, int) else len(n))]
++st.expander = lambda *a, **k: Ctx()
++st.radio = lambda label, options, **k: OV.get(k["key"], options[0])
++st.number_input = lambda label, mn, mx, val, **k: OV.get(k["key"], val)
++st.button = lambda label, **k: OV.get(k["key"], False)
++st.text_area = lambda label, value="", **k: OV.get(k["key"], value)
++st.multiselect = lambda label, options, default=None, **k: OV.get(k["key"], list(default or []))
++st.selectbox = lambda label, options, **k: options[0]
++class Bar:
++    def progress(self, *a, **k): pass
++    def empty(self): pass
++st.progress = lambda *a, **k: Bar()
++st.metric = lambda label, value, **k: LOG["metrics"].__setitem__(label, value)
++st.dataframe = lambda x, *a, **k: LOG["frames"].append(x)
++def _bar(x, *a, **k):
++    assert len(x) > 0 and list(x.columns) == ["call", "put"]; LOG["charts"] += 1
++st.bar_chart = _bar
++st.download_button = lambda label, data, **k: None
++sys.modules["streamlit"] = st
++import gamma_tab as tab
++gs.yf_chain = loader
++
++tab.render(); assert LOG["infos"] and not LOG["errors"]          # nothing run yet
++OV.update(gam_universe="My tickers", gam_tickers="NEG, POS, BOOM", gam_run=True, gam_f_oi=0, gam_f_reg=["Negative", "Positive", "Near flip"])
++tab.render()
++assert not LOG["errors"] and LOG["frames"] and list(LOG["frames"][-1]["ticker"]) == ["NEG", "POS"], LOG
++assert LOG["charts"] == 1 and LOG["metrics"]["Negative"] == 1
++print("gamma_tab ok")
+-- 
+2.43.0
+
