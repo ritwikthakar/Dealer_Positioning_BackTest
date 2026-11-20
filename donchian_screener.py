@@ -192,7 +192,8 @@ def get_sp500_tickers():
     r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
                      headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
     r.raise_for_status()
-    for tbl in pd.read_html(r.text):
+    from io import StringIO
+    for tbl in pd.read_html(StringIO(r.text)):
         cols = [str(x).lower().strip() for x in tbl.columns]
         if "symbol" in cols:
             s = tbl.iloc[:, cols.index("symbol")].astype(str).str.strip().str.replace(".", "-", regex=False)
