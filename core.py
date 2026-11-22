@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-CORE_VERSION = "2026-11-17.2"   # app.py refuses to run against a core.py with a different stamp
+import vanna_charm
+
+CORE_VERSION = "2026-11-21.1"   # app.py refuses to run against a core.py with a different stamp
 
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
@@ -122,7 +124,7 @@ def parse_chain(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["exp"] = pd.to_datetime(d["expiration_date"].astype(str).str[:10])
     d["cp"] = d["type"].astype(str).str[0].str.upper()
-    for c in ["strike", "bid", "ask", "mid", "implied_volatility", "delta", "gamma", "volume", "open_interest"]:
+    for c in ["strike", "bid", "ask", "mid", "implied_volatility", "delta", "gamma", "vanna", "charm", "volume", "open_interest"]:
         if c in d:
             d[c] = pd.to_numeric(d[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
     if "oi_chg" in d:
@@ -1088,7 +1090,7 @@ def wall_oi_tags(oi: dict | None, walls: dict | None) -> list[dict]:
 SNAP_COLS = ["asof", "spot", "band", "score", "gamma_regime", "net_gex_window", "agg_flip", "put_wall", "call_wall",
              "put_wall_put_oi", "put_wall_put_chg", "call_wall_call_oi", "call_wall_call_chg", "win_net_call_chg",
              "win_net_put_chg", "win_put_add_share", "win_gross_turnover", "win_known_share", "win_net_dgex",
-             "top_put_add_strike", "top_call_add_strike"]
+             "top_put_add_strike", "top_call_add_strike", "vanna_put_sh_per_pt", "charm_put_sh_per_day", "squeeze_level"]
 
 
 def snapshot_row(R: dict) -> dict:
@@ -1101,6 +1103,11 @@ def snapshot_row(R: dict) -> dict:
                 "score": round(float(d["score"]), 4), "gamma_regime": g["effective"],
                 "net_gex_window": float(g["net"]), "agg_flip": float(af["flip"]) if af else nan,
                 "put_wall": wl.get("put_wall", nan), "call_wall": wl.get("call_wall", nan)})
+    vc, sq = R.get("vanna_charm"), R.get("squeeze")
+    if vc and vc.get("ok"):
+        row.update({"vanna_put_sh_per_pt": vc["put_vanna"], "charm_put_sh_per_day": vc["put_charm"]})
+    if sq and sq.get("ok"):
+        row["squeeze_level"] = sq["level"]
     if oi is not None:
         s = oi["summary"]
         row.update({"win_net_call_chg": s["net_call_chg"], "win_net_put_chg": s["net_put_chg"],
@@ -1193,8 +1200,13 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
                  "min_contracts": opts.get("oi_min_contracts", OI_DEFAULTS["min_contracts"]),
                  "band": opts.get("oi_band", OI_DEFAULTS["band"])}
     oi = oi_change_tables(chain, spot, asof, opts.get("reg_min_dte", 1), opts.get("reg_max_dte", 45), oi_params)
-    return {"oi": oi, "oi_walls": wall_oi_tags(oi, walls), "oi_params": {**OI_DEFAULTS, **oi_params},
-            "agg_flip": profile_flip(gs, spot),
+    vc_params = {k: v for k, v in (opts.get("vanna_charm") or {}).items() if k in vanna_charm.DEFAULTS}
+    vc = vanna_charm.positioning(chain, spot, asof, vc_params)
+    af = profile_flip(gs, spot)
+    sq = vanna_charm.squeeze_alert(hc, vc, reg["effective"], spot, af["flip"] if af else None,
+                                   walls.get("call_wall") if walls else None, vc_params)
+    return {"vanna_charm": vc, "squeeze": sq, "oi": oi, "oi_walls": wall_oi_tags(oi, walls), "oi_params": {**OI_DEFAULTS, **oi_params},
+            "agg_flip": af,
             "gex_trend": gex_trend, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
             "candle_mode": candle_mode, "hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
             "flow": fl, "flow_symbol": flow_symbol, "flow_source": flow_source, "dex_hist": float(last["dex"]), "dex_exp": dexs,

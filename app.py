@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 import core
+import vanna_charm
 import screener_tab
 import ichimoku_tab
 import gamma_tab
@@ -20,7 +21,7 @@ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
 # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
 # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
-EXPECTED_CORE = "2026-11-17.2"
+EXPECTED_CORE = "2026-11-21.1"
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
     core = importlib.reload(core)
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
@@ -48,6 +49,11 @@ def fmt_big(x: float) -> str:
 
 def fmt_contracts(x: float) -> str:
     return "n/a" if x is None or np.isnan(x) else f"{x:+,.0f}"
+
+
+def fmt_sh(x: float) -> str:
+    """Dealer hedge flow in millions of shares, signed (+ = dealers buy)."""
+    return "n/a" if x is None or np.isnan(x) else f"{x / 1e6:+.2f}M sh"
 
 
 def tag_text(tag: str) -> str:
@@ -127,6 +133,26 @@ with st.sidebar:
         st.caption("A move must clear both the % and the contract threshold to be tagged. These are judgment "
                    "calls, not fitted values. OI change is context only and never enters the score.")
 
+    with st.expander("Vanna / charm and squeeze alert"):
+        vc_conv = st.selectbox("Dealer positioning assumption", list(vanna_charm.CONVENTIONS), key="vc_conv",
+                               format_func=lambda k: vanna_charm.CONVENTIONS[k],
+                               help="Open interest does not say who is long or short. Customers owning OTM puts "
+                                    "(dealers short) is the defensible assumption; OTM calls could go either way, so "
+                                    "they are excluded by default and shown as a +/- range.")
+        vc_max = st.number_input("Vanna/charm window: max DTE", 5, 800, int(vanna_charm.DEFAULTS["max_dte"]), key="vc_max",
+                                 help="Back-month IV usually moves less than front-month IV, so very long dated "
+                                      "open interest is left out by default.")
+        vc_band = st.number_input("Near-spot band (%)", 2, 30, int(vanna_charm.DEFAULTS["near_band"] * 100), key="vc_band")
+        st.caption("Squeeze alert thresholds (judgment calls, not fitted values):")
+        sq_ret5 = st.number_input("Price stretched: 5-session drop (%)", 1.0, 20.0, vanna_charm.DEFAULTS["sq_ret5"] * 100, 0.5, key="sq_ret5")
+        sq_ret20 = st.number_input("... or 20-session drop (%)", 2.0, 40.0, vanna_charm.DEFAULTS["sq_ret20"] * 100, 0.5, key="sq_ret20")
+        sq_dex = st.number_input("DEX washout: bottom X% of 120 sessions", 1, 50, int(vanna_charm.DEFAULTS["sq_dex_pct"] * 100), key="sq_dex")
+        sq_ivr = st.number_input("Vol elevated: IV rank at least", 0, 200, int(vanna_charm.DEFAULTS["sq_ivrank"]), key="sq_ivr")
+        sq_recent = st.number_input("Washout must be within the last N sessions", 1, 20, int(vanna_charm.DEFAULTS["sq_recent"]), key="sq_recent")
+        sq_min_v = st.number_input("Min put-side vanna (M shares per vol pt)", 0.0, 10.0, vanna_charm.DEFAULTS["sq_min_vanna"] / 1e6, 0.05, key="sq_min_v")
+        sq_min_c = st.number_input("Min put-side charm (M shares per day)", 0.0, 10.0, vanna_charm.DEFAULTS["sq_min_charm"] / 1e6, 0.05, key="sq_min_c")
+        sq_rng = st.number_input("Vol-turn trigger: 10-session IV30 range at least (pts)", 0.0, 30.0, vanna_charm.DEFAULTS["sq_iv_range"], 0.5, key="sq_rng")
+
 # ------------------------------------------------------------------ load data
 data = {}
 if folder.strip():
@@ -171,6 +197,12 @@ opts = {
     "oi_build_pct": float(oi_build) / 100.0, "oi_strong_pct": float(oi_strong) / 100.0,
     "oi_min_contracts": float(oi_min), "oi_band": float(oi_band) / 100.0,
     "flow_symbol": flow_sym.strip(),
+    "vanna_charm": {
+        "convention": vc_conv, "max_dte": int(vc_max), "near_band": float(vc_band) / 100.0,
+        "sq_ret5": float(sq_ret5) / 100.0, "sq_ret20": float(sq_ret20) / 100.0, "sq_dex_pct": float(sq_dex) / 100.0,
+        "sq_ivrank": float(sq_ivr), "sq_recent": int(sq_recent), "sq_min_vanna": float(sq_min_v) * 1e6,
+        "sq_min_charm": float(sq_min_c) * 1e6, "sq_iv_range": float(sq_rng),
+    },
 }
 
 try:
@@ -242,6 +274,17 @@ with tab_over:
     c4.metric("IV rank", f"{R['ivrank']:.0f}" if R["ivrank"] is not None else "n/a")
     c4.caption(f"front-back IV edge {R['edge']['edge_pts']:+.1f} pts")
 
+    # ---- short-squeeze / relief-rally alert (details in the "Vanna & charm positioning" section below)
+    sq = R["squeeze"]
+    if sq.get("ok"):
+        banner = {"alert": st.success, "armed": st.warning, "watch": st.info}.get(sq["level"])
+        if banner is not None:
+            banner(f"**{sq['headline']}**")
+        else:
+            st.caption(sq["headline"])
+    else:
+        st.caption(f"Squeeze alert unavailable: {sq.get('reason', 'unknown reason')}")
+
     comp_rows = []
     for k in ("price", "flow", "dex"):
         v = R["components"][k]
@@ -299,6 +342,95 @@ with tab_over:
                                f"(range {g['flip_min']:.0f} to {g['flip_max']:.0f}; nearest expiry "
                                f"{nd.date() if nd is not None else 'n/a'}: {g['flip_nearest']:.1f}). "
                                "The near-flip check uses this figure. Model estimates.")
+
+    # ---- vanna & charm positioning and the short-squeeze checklist
+    st.subheader("Vanna & charm positioning")
+    vc, sq = R["vanna_charm"], R["squeeze"]
+    if not vc.get("ok"):
+        st.info(vc.get("reason", "Vanna / charm positioning is unavailable."))
+    else:
+        lo, hi = vc["window"]
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Vanna: dealer buying if IV falls 1 pt", fmt_sh(vc["put_vanna"]))
+        a1.caption(f"OTM puts, dealers short. About ${vc['put_vanna'] * R['spot'] / 1e9:.2f}B per vol point; "
+                   f"{fmt_sh(vc['put_vanna_near'])} of it within {vc['near_band']:.0%} of spot.")
+        a2.metric("Charm: dealer buying per day", fmt_sh(vc["put_charm"]))
+        a2.caption(f"Put deltas decay toward zero as time passes. A weekend (3 days) is roughly "
+                   f"{fmt_sh(3 * vc['put_charm'])}; {fmt_sh(vc['put_charm_near'])}/day within {vc['near_band']:.0%} of spot.")
+        a3.metric("Call side (dealer side unknown)", f"\u00b1{abs(vc['call_vanna']) / 1e6:.2f}M sh")
+        a3.caption(f"Vanna \u00b1{abs(vc['call_vanna']) / 1e6:.2f}M per vol pt and charm \u00b1{abs(vc['call_charm']) / 1e6:.2f}M/day: "
+                   "positive if dealers are long the calls, negative if short. Not in the headline.")
+        if vc["convention"] != "puts":
+            st.caption(f"Selected assumption: {vc['convention_label']}. Net vanna {fmt_sh(vc['net_vanna'])} per vol pt, "
+                       f"net charm {fmt_sh(vc['net_charm'])} per day.")
+        st.caption(f"Window {lo}-{hi} DTE, OTM options only, positive = dealers buy the underlying. Vanna and charm only "
+                   "become buying when implied vol actually falls or time passes; they are potential flow, not a price forecast.")
+
+        z1, z2 = st.columns(2)
+        with z1:
+            st.markdown("**IV-drop scenarios**")
+            scen = vc["scenarios"].copy()
+            st.dataframe(scen.round(2), hide_index=True)
+            st.markdown("**By put strike (distance below spot)**")
+            bz = vc["by_zone"].copy()
+            bz["vanna (M sh/pt)"] = bz["vanna_sh_per_pt"] / 1e6
+            bz["charm (M sh/day)"] = bz["charm_sh_per_day"] / 1e6
+            st.dataframe(bz[["put strikes", "vanna (M sh/pt)", "charm (M sh/day)"]].round(3), hide_index=True)
+        with z2:
+            st.markdown("**By expiry**")
+            bd = vc["by_dte"].copy()
+            bd["vanna (M sh/pt)"] = bd["vanna_sh_per_pt"] / 1e6
+            bd["charm (M sh/day)"] = bd["charm_sh_per_day"] / 1e6
+            st.dataframe(bd[["expiry bucket", "vanna (M sh/pt)", "charm (M sh/day)"]].round(3), hide_index=True)
+            st.markdown("**Largest put-side vanna strikes**")
+            tp = vc["top"].copy()
+            tp["exp"] = tp["exp"].dt.date
+            tp["vanna (k sh/pt)"] = tp["vflow"] / 1e3
+            tp["charm (k sh/day)"] = tp["cflow"] / 1e3
+            st.dataframe(tp[["exp", "strike", "open_interest", "vanna (k sh/pt)", "charm (k sh/day)"]].round(1), hide_index=True)
+
+    st.subheader("Short-squeeze checklist")
+    st.caption("A dealer-driven relief rally / short-covering move, not a stock short-interest squeeze. It needs a washout, "
+               "dealer positioning that supports a bounce, and a trigger: implied vol rolling over while price stabilises.")
+    if not sq.get("ok"):
+        st.info(sq.get("reason", "The alert could not be evaluated."))
+    else:
+        chk = sq["checks"].copy()
+        chk["met"] = chk["met"].map({True: "\u2713", False: "\u2717"})
+        st.dataframe(chk.rename(columns={"group": "stage", "met": "met?"}), hide_index=True)
+        st.caption(f"Washout seen in the last {sq['recent_window']} sessions: {'yes' if sq['setup_recent'] else 'no'}. "
+                   "Level: none -> watch (washout) -> armed (IV rolling over) -> alert (price stabilising with dealer support).")
+        if sq["levels"]:
+            st.caption("Levels to watch: " + "  |  ".join(
+                f"{n} {v:.1f}" + ("" if n == "Spot" else f" ({v - R['spot']:+.1f} pts)") for n, v in sq["levels"]))
+        with st.expander("How often did this fire in the history file?"):
+            hh = sq["history"]
+            rows = [{"signal": f"All sessions (baseline, {hh['n_days']} days)", "events": hh["n_days"],
+                     **{f"{n[1:]}d mean": hh["baseline"][n] for n in ("f5", "f10", "f20")},
+                     **{f"{n[1:]}d up": hh["baseline_hit"][n] for n in ("f5", "f10", "f20")}}]
+            for key, label in (("trigger", "IV falling 2 sessions + price up"),
+                               ("washout_then_trigger", "Washout, then the trigger (the alert)")):
+                st_ = hh[key]["stats"]
+                rows.append({"signal": label, "events": hh[key]["n_events"],
+                             **{f"{n[1:]}d mean": st_[n]["mean"] for n in ("f5", "f10", "f20")},
+                             **{f"{n[1:]}d up": st_[n]["hit"] for n in ("f5", "f10", "f20")}})
+            ev = pd.DataFrame(rows)
+            for c in ev.columns:
+                if c.endswith("mean"):
+                    ev[c] = ev[c].map(lambda v: "n/a" if pd.isna(v) else f"{v:+.1%}")
+                elif c.endswith("up"):
+                    ev[c] = ev[c].map(lambda v: "n/a" if pd.isna(v) else f"{v:.0%}")
+            st.dataframe(ev, hide_index=True)
+            e2 = hh["washout_then_trigger"]["events"].copy()
+            if len(e2):
+                e2.index = pd.to_datetime(e2.index).date
+                e2 = e2.rename(columns={"px": "close", "iv30": "IV30", "ivrank": "IV rank", "f5": "next 5d",
+                                        "f10": "next 10d", "f20": "next 20d"})
+                for c in ("next 5d", "next 10d", "next 20d"):
+                    e2[c] = e2[c].map(lambda v: "n/a" if pd.isna(v) else f"{v:+.1%}")
+                st.dataframe(e2.round(2))
+            st.caption("Events are de-clustered (at least 10 sessions apart). Samples this small say little: compare each "
+                       "row with the baseline before reading anything into it. Thresholds are judgment calls, not fitted.")
 
     # ---- open-interest change (display only; not part of the score)
     st.subheader("Open-interest change")

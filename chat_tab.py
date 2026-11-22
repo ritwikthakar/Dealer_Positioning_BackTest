@@ -103,6 +103,30 @@ def _regime(R):
     return out
 
 
+def _vanna_squeeze(R):
+    vc, sq = R.get("vanna_charm"), R.get("squeeze")
+    out = []
+    if vc and vc.get("ok"):
+        lo, hi = vc["window"]
+        out.append(f"Dealer hedge flow from OTM puts (dealers assumed short), {lo}-{hi} DTE, positive = dealers buy: "
+                   f"vanna {_fnum(vc['put_vanna'] / 1e6, 2, True)}M shares per 1 vol pt of IV decline, "
+                   f"charm {_fnum(vc['put_charm'] / 1e6, 2, True)}M shares per day.")
+        out.append(f"Call side (dealer side unknown, excluded from the headline): vanna +/-{_fnum(abs(vc['call_vanna']) / 1e6, 2)}M, "
+                   f"charm +/-{_fnum(abs(vc['call_charm']) / 1e6, 2)}M. Selected assumption: {vc['convention_label']}.")
+        for _, r in vc["scenarios"].iterrows():
+            out.append(f"IV {r['IV change (vol pts)']:+.0f} pts -> put-side buying {_fnum(r['put-side shares (M)'], 2, True)}M shares "
+                       f"(${_fnum(r['put-side $ (B)'], 2)}B).")
+    if sq and sq.get("ok"):
+        out.append(f"Short-squeeze alert level: {sq['level']}. {sq['headline']}")
+        for _, r in sq["checks"].iterrows():
+            out.append(f"- [{r['group']}] {r['condition']}: {'met' if r['met'] else 'not met'} ({r['reading']})")
+        h = sq["history"]["washout_then_trigger"]
+        out.append(f"History file: washout-then-trigger fired {h['n_events']} times; mean next 5d "
+                   f"{_fnum(h['stats']['f5']['mean'] * 100, 1, True)}%, 20d {_fnum(h['stats']['f20']['mean'] * 100, 1, True)}% "
+                   f"(small sample, thresholds are judgment calls).")
+    return out
+
+
 def _vol(R):
     e = R["edge"]
     return [f"IV rank: {_fnum(R['ivrank'], 0) if R['ivrank'] is not None else 'n/a'}.",
@@ -268,6 +292,7 @@ def build_context(R=None, scr_res=None, scr_when=None, ich_res=None, ich_when=No
         _section(lines, "Direction", lambda: _direction(R))
         _section(lines, "Gamma regime, flip, walls, dealer trends", lambda: _regime(R))
         _section(lines, "Volatility gates", lambda: _vol(R))
+        _section(lines, "Vanna / charm positioning and short-squeeze alert", lambda: _vanna_squeeze(R))
         _section(lines, "Flow", lambda: _flow(R))
         _section(lines, "Open-interest change", lambda: _oi(R))
         _section(lines, "GEX / DEX by expiration (per-expiry breakdown)", lambda: _by_expiration(R))

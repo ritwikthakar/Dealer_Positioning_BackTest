@@ -27,6 +27,14 @@ contract, with d GEX in the same units as the GEX file. The Strategies tab shows
 A daily snapshot log (one row per as-of date) can be saved or downloaded so the signal can be tested once there is
 enough history; one day of data cannot be backtested.
 
+Vanna & charm and the squeeze alert (Score & regime tab): `vanna_charm.py` turns the chain's vanna and charm columns
+into dealer hedge flow in shares (positive = dealers buy). Headline = OTM puts only, assuming dealers are short them; the
+OTM-call side is shown as a +/- range because open interest does not say who is long. A checklist (price stretched, DEX
+washout, IV rank, negative gamma, put-side vanna/charm support, 30d IV falling two sessions in a row, price stabilising)
+drives a none / watch / armed / alert banner. Thresholds are judgment calls (sidebar expander), and the tab shows how often
+the same trigger fired in the history file; that sample is small. The squeeze here means a dealer-driven relief rally, not
+a stock short-interest squeeze. Tests: `python3 test_vanna_charm.py [folder]`.
+
 Tests (no Streamlit needed):  python3 test_core.py <folder>, python3 test_features.py <folder>, python3 test_oi.py <folder>
 (test_features blocks scipy on purpose: the app must run without it.)
 `backtest_standalone.py` is the corrected standalone backtest (fixes a vol-score scaling bug in the earlier copy).
