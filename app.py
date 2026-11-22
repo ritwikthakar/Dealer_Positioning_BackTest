@@ -21,7 +21,7 @@ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
 # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
 # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
-EXPECTED_CORE = "2026-11-21.1"
+EXPECTED_CORE = "2026-11-22.1"
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
     core = importlib.reload(core)
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
@@ -54,6 +54,42 @@ def fmt_contracts(x: float) -> str:
 def fmt_sh(x: float) -> str:
     """Dealer hedge flow in millions of shares, signed (+ = dealers buy)."""
     return "n/a" if x is None or np.isnan(x) else f"{x / 1e6:+.2f}M sh"
+
+
+VC_TREND_COLS = {"vanna_put_sh_per_pt": "Put-side vanna (M shares per vol pt)",
+                 "charm_put_sh_per_day": "Put-side charm (M shares per day)",
+                 "vanna_call_sh_per_pt": "Call-side vanna, if dealers are long the calls (M shares per vol pt)",
+                 "charm_call_sh_per_day": "Call-side charm, if dealers are long the calls (M shares per day)"}
+
+
+def vc_trend_ui(full) -> None:
+    """Trend of the put-side vanna / charm readings, from the daily snapshot log (one point per as-of date)."""
+    if full is None or not {"vanna_put_sh_per_pt", "charm_put_sh_per_day"} <= set(full.columns):
+        st.caption("Trend: no vanna / charm readings in the snapshot log yet.")
+        return
+    cols = [k for k in VC_TREND_COLS if k in full.columns]
+    t = full[["asof", *cols]].copy()
+    t["asof"] = pd.to_datetime(t["asof"], errors="coerce")
+    for k in cols:
+        t[k] = pd.to_numeric(t[k], errors="coerce") / 1e6
+    t = t.dropna(subset=["asof"]).dropna(subset=cols, how="all").set_index("asof").sort_index()
+    if len(t) < 2:
+        st.caption("Trend: one chain file is one day, so there is only one reading so far. Save a snapshot "
+                   "(Dealer map tab, Daily snapshot log) after each new export and the chart fills in.")
+        return
+    st.markdown("**Trend of the vanna / charm readings (daily snapshot log)**")
+    slots = []
+    for i in range(0, len(cols), 2):
+        slots += list(st.columns(2))
+    for col, k in zip(slots, cols):
+        label = VC_TREND_COLS[k]
+        v = t[k].dropna()
+        with col:
+            st.caption(label)
+            st.line_chart(v.rename(label).to_frame(), height=160)
+            if len(v) >= 2:
+                st.caption(f"latest {v.iloc[-1]:+.2f}, previous reading {v.iloc[-2]:+.2f} "
+                           f"({v.iloc[-1] - v.iloc[-2]:+.2f}); {len(v)} readings")
 
 
 def tag_text(tag: str) -> str:
@@ -346,6 +382,7 @@ with tab_over:
     # ---- vanna & charm positioning and the short-squeeze checklist
     st.subheader("Vanna & charm positioning")
     vc, sq = R["vanna_charm"], R["squeeze"]
+    vc_trend_slot = None
     if not vc.get("ok"):
         st.info(vc.get("reason", "Vanna / charm positioning is unavailable."))
     else:
@@ -365,6 +402,8 @@ with tab_over:
                        f"net charm {fmt_sh(vc['net_charm'])} per day.")
         st.caption(f"Window {lo}-{hi} DTE, OTM options only, positive = dealers buy the underlying. Vanna and charm only "
                    "become buying when implied vol actually falls or time passes; they are potential flow, not a price forecast.")
+
+        vc_trend_slot = st.container()      # filled further down, once the snapshot log has been loaded
 
         z1, z2 = st.columns(2)
         with z1:
@@ -403,6 +442,8 @@ with tab_over:
         if sq["levels"]:
             st.caption("Levels to watch: " + "  |  ".join(
                 f"{n} {v:.1f}" + ("" if n == "Spot" else f" ({v - R['spot']:+.1f} pts)") for n, v in sq["levels"]))
+        st.markdown("**30d IV, last 60 sessions** (the trigger needs it to fall two sessions in a row)")
+        st.line_chart(sq["series"][["iv30"]].tail(60).rename(columns={"iv30": "IV30"}), height=160)
         with st.expander("How often did this fire in the history file?"):
             hh = sq["history"]
             rows = [{"signal": f"All sessions (baseline, {hh['n_days']} days)", "events": hh["n_days"],
@@ -526,6 +567,7 @@ with tab_strat:
             st.caption(f"P&L at {s.eval_date.date()} vs QQQ price. Net debit negative = credit. "
                        "POP is a lognormal estimate at ATM IV, not a forecast.")
 
+full = None            # the snapshot log, set inside the Dealer map tab when open-interest data exists
 with tab_dealer:
     w = R["walls"]
     if not w:
@@ -629,6 +671,10 @@ with tab_dealer:
         st.dataframe(full.tail(30), hide_index=True)
         st.download_button("Download log (including today's row)", full.to_csv(index=False).encode("utf-8"),
                            file_name="oi_snapshots.csv", mime="text/csv", key="snap_dl")
+
+if vc_trend_slot is not None:
+    with vc_trend_slot:
+        vc_trend_ui(full)
 
 with tab_flow:
     f = R["flow"]

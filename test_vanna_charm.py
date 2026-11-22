@@ -119,6 +119,20 @@ def test_real_files():
     assert 600 < spot < 625, spot
 
 
+def test_snapshot_schema():
+    """The daily snapshot log carries the put- and call-side readings the trend charts use."""
+    import core
+    for k in ("vanna_put_sh_per_pt", "charm_put_sh_per_day", "vanna_call_sh_per_pt", "charm_call_sh_per_day"):
+        assert k in core.SNAP_COLS, k
+    old = {c: 1 for c in core.SNAP_COLS[:21]}
+    old["asof"] = "2026-11-02"                       # a log written before these columns existed
+    new = {c: float("nan") for c in core.SNAP_COLS}
+    new.update(asof="2026-11-20", vanna_put_sh_per_pt=5e5, vanna_call_sh_per_pt=1.7e6)
+    m = core.merge_snapshot(core.merge_snapshot(None, old), new)
+    assert list(m.columns)[:len(core.SNAP_COLS)] == core.SNAP_COLS and len(m) == 2
+    assert m["vanna_put_sh_per_pt"].isna().iloc[0] and m["vanna_put_sh_per_pt"].iloc[1] == 5e5
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

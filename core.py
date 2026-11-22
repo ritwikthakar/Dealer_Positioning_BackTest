@@ -20,7 +20,7 @@ import pandas as pd
 
 import vanna_charm
 
-CORE_VERSION = "2026-11-21.1"   # app.py refuses to run against a core.py with a different stamp
+CORE_VERSION = "2026-11-22.1"   # app.py refuses to run against a core.py with a different stamp
 
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
@@ -1090,7 +1090,8 @@ def wall_oi_tags(oi: dict | None, walls: dict | None) -> list[dict]:
 SNAP_COLS = ["asof", "spot", "band", "score", "gamma_regime", "net_gex_window", "agg_flip", "put_wall", "call_wall",
              "put_wall_put_oi", "put_wall_put_chg", "call_wall_call_oi", "call_wall_call_chg", "win_net_call_chg",
              "win_net_put_chg", "win_put_add_share", "win_gross_turnover", "win_known_share", "win_net_dgex",
-             "top_put_add_strike", "top_call_add_strike", "vanna_put_sh_per_pt", "charm_put_sh_per_day", "squeeze_level"]
+             "top_put_add_strike", "top_call_add_strike", "vanna_put_sh_per_pt", "charm_put_sh_per_day", "vanna_call_sh_per_pt", "charm_call_sh_per_day",
+             "squeeze_level"]
 
 
 def snapshot_row(R: dict) -> dict:
@@ -1105,7 +1106,8 @@ def snapshot_row(R: dict) -> dict:
                 "put_wall": wl.get("put_wall", nan), "call_wall": wl.get("call_wall", nan)})
     vc, sq = R.get("vanna_charm"), R.get("squeeze")
     if vc and vc.get("ok"):
-        row.update({"vanna_put_sh_per_pt": vc["put_vanna"], "charm_put_sh_per_day": vc["put_charm"]})
+        row.update({"vanna_put_sh_per_pt": vc["put_vanna"], "charm_put_sh_per_day": vc["put_charm"],
+                    "vanna_call_sh_per_pt": vc["call_vanna"], "charm_call_sh_per_day": vc["call_charm"]})
     if sq and sq.get("ok"):
         row["squeeze_level"] = sq["level"]
     if oi is not None:
