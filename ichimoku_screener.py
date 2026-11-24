@@ -15,7 +15,7 @@ the close 26 bars ago, and the "future cloud" is only read at the latest bar, ne
 ATR/ADX (Wilder) and the data helpers come from donchian_screener.py. Output is a candidate list, not validated trade signals.
 """
 import argparse
-import datetime as dt
+import functools
 import sys
 
 import numpy as np
@@ -81,11 +81,12 @@ def scan_symbol(d, sym, lookback=3, adx_min=20, touch=0.25):
         return []
     f = compute_flags(d, adx_min, touch)
     rows = []
+    intraday = dsc.is_intraday(d.index)
 
     def base(i, setup, side, grade, level, stop, note):
         r = d.iloc[i]
         rows.append(dict(ticker=sym, setup=setup, side=side, grade=grade, bars_ago=len(d) - 1 - i,
-                         date=d.index[i].date(), close=round(r["Close"], 2),
+                         date=dsc.bar_stamp(d.index[i], intraday), close=round(r["Close"], 2),
                          level=round(level, 2) if np.isfinite(level) else np.nan,
                          dist_atr=round((r["Close"] - level) / r["atr"], 2) if np.isfinite(level) else np.nan,
                          stop=round(stop, 2) if np.isfinite(stop) else np.nan, adx=round(r["adx"], 1),
@@ -173,10 +174,10 @@ def scan_symbol(d, sym, lookback=3, adx_min=20, touch=0.25):
 
 # ---------------------------------------------------------------- driver
 def run(tickers=None, lookback=3, out="ichimoku_setups.csv", start=None, chunk=80, loader=None, min_rows=MIN_ROWS,
-        verbose=True, progress=None):
+        verbose=True, progress=None, interval="1d"):
     tickers = tickers or dsc.get_sp500_tickers()
-    start = start or (dt.date.today() - dt.timedelta(days=900)).isoformat()
-    loader = loader or dsc.yf_loader
+    start = start or dsc.default_start(interval)
+    loader = loader or functools.partial(dsc.yf_loader, interval=interval)   # a custom loader is still called as loader(part, start)
     sigs, failed, short = [], [], []
     for s in range(0, len(tickers), chunk):
         part = tickers[s:s + chunk]
@@ -196,7 +197,7 @@ def run(tickers=None, lookback=3, out="ichimoku_setups.csv", start=None, chunk=8
                 if df is None or df.empty:
                     failed.append(t)
                     continue
-                df = dsc.drop_partial_bar(df)
+                df = dsc.drop_partial_bar(df, interval=interval)
                 if len(df) < min_rows:
                     short.append(t)
                     continue
@@ -207,7 +208,7 @@ def run(tickers=None, lookback=3, out="ichimoku_setups.csv", start=None, chunk=8
     if progress:
         progress(len(tickers), len(tickers))
     res = pd.DataFrame(sigs)
-    res.attrs.update(failed=failed, short=short, n_tickers=len(tickers), min_rows=min_rows)
+    res.attrs.update(failed=failed, short=short, n_tickers=len(tickers), min_rows=min_rows, interval=interval)
     if not res.empty:
         order = {"tk_cross": 0, "cloud_break": 1, "kijun_bounce": 2, "kumo_twist": 3}
         res["_o"] = res["setup"].map(order)
@@ -233,8 +234,9 @@ def main(argv=None):
     ap.add_argument("tickers", nargs="*")
     ap.add_argument("--lookback", type=int, default=3)
     ap.add_argument("--out", default="ichimoku_setups.csv")
+    ap.add_argument("--interval", default="1d", choices=sorted(dsc.INTERVALS.values()), help="bar size: 1d (default) or 1h")
     a, _ = ap.parse_known_args(argv)                  # tolerate Colab/Jupyter's extra -f argument
-    run(a.tickers or None, lookback=a.lookback, out=a.out)
+    run(a.tickers or None, lookback=a.lookback, out=a.out, interval=a.interval)
     return 0
 
 

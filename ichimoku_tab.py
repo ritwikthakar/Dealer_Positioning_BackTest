@@ -31,14 +31,36 @@ HELP = {
 }
 
 
+def _future_slots(last, n):
+    """The next n hourly US session bars after `last` (09:30 .. 15:30 starts, weekends skipped, exchange holidays ignored)."""
+    if last.tzinfo is not None:
+        last = last.tz_convert("America/New_York")
+    out, day = [], last.normalize()
+    while len(out) < n:
+        if day.weekday() < 5:
+            for k in range(7):
+                t = day.replace(hour=9, minute=30) + pd.Timedelta(hours=k)
+                if t > last:
+                    out.append(t)
+        day = (day + pd.Timedelta(hours=36)).normalize()
+    return pd.DatetimeIndex(out[:n])
+
+
 def candle_spec(d, days=120, height=380, shift=26):
-    """Candles + Tenkan, Kijun and the shaded cloud (with the cloud projected `shift` bars ahead), from ichimoku_screener.add_indicators."""
+    """Candles + Tenkan, Kijun and the shaded cloud (with the cloud projected `shift` bars ahead), from ichimoku_screener.add_indicators.
+    Daily frames get a date axis; intraday frames get an ordinal bar axis (no overnight / weekend gaps)."""
+    import donchian_screener as dsc
     x = d.tail(days).copy()
-    x["date"] = x.index
+    intraday = dsc.is_intraday(x.index)
     last = d.iloc[-shift:]
-    # projected cloud: today's un-shifted spans belong to the next `shift` sessions (weekends skipped, exchange holidays ignored)
-    fut = pd.DataFrame({"date": pd.bdate_range(x.index[-1] + pd.Timedelta(days=1), periods=len(last)),
-                        "sa": last["sa_raw"].to_numpy(), "sb": last["sb_raw"].to_numpy()})
+    if intraday:
+        fut_dates = dtab.stamp_labels(_future_slots(x.index[-1], len(last)))
+        x["date"] = dtab.stamp_labels(x.index)
+    else:
+        x["date"] = x.index
+        # projected cloud: today's un-shifted spans belong to the next `shift` sessions (weekends skipped, exchange holidays ignored)
+        fut_dates = pd.bdate_range(x.index[-1] + pd.Timedelta(days=1), periods=len(last))
+    fut = pd.DataFrame({"date": fut_dates, "sa": last["sa_raw"].to_numpy(), "sb": last["sb_raw"].to_numpy()})
     cl = pd.concat([x[["date", "sa", "sb"]], fut], ignore_index=True).dropna()
     cl["lo"], cl["hi"] = cl[["sa", "sb"]].min(axis=1), cl[["sa", "sb"]].max(axis=1)
     cl["cloud"] = np.where(cl["sa"] >= cl["sb"], "bull", "bear")
@@ -52,10 +74,10 @@ def candle_spec(d, days=120, height=380, shift=26):
     lo, hi = float(np.nanmin(lows)), float(np.nanmax(highs))
     pad = (hi - lo) * 0.03 or 1.0
     dom = [lo - pad, hi + pad]
-    xe = {"field": "date", "type": "temporal", "axis": {"title": None, "format": "%b %d", "labelOverlap": True}}
+    xe, tip_date = dtab.x_encoding(list(x["date"]) + list(fut_dates) if intraday else None)
     ye = lambda f, **kw: {"field": f, "type": "quantitative", "scale": {"zero": False, "domain": dom}, "axis": {"title": None}, **kw}
     color = {"condition": {"test": "datum.close >= datum.open", "value": "#26a69a"}, "value": "#ef5350"}
-    tip = [{"field": "date", "type": "temporal", "title": "Date", "format": "%Y-%m-%d"}] + [
+    tip = [tip_date] + [
         {"field": f, "type": "quantitative", "title": f.title(), "format": ".2f"} for f in ("open", "high", "low", "close")]
     bar = int(max(2, min(9, 650 / max(len(x) + len(fut), 1) * 0.7)))
     cloud_data = {"values": recs(cl, ["date", "sa", "sb", "lo", "hi", "cloud"])}
@@ -85,14 +107,16 @@ def render(show_vega=None):
 
     st.subheader("Ichimoku setup screener")
     st.caption("Four setups, both directions, graded with ADX and ATR. Classic 9 / 26 / 52 settings; the cloud under a bar is the one "
-               "computed 26 bars earlier, so nothing looks ahead. Daily data from Yahoo Finance via yfinance; the last bar is dropped "
-               "while the US market is open. Candidate list for review, not trade signals.")
-    c1, c2, c3 = st.columns([2, 1, 1])
+               "computed 26 bars earlier, so nothing looks ahead. Daily or 1-hour data from Yahoo Finance via yfinance; the latest bar "
+               "is dropped until it has finished. Candidate list for review, not trade signals.")
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     universe = c1.radio("Universe", ["S&P 500", "My tickers"], horizontal=True, key="ich_universe")
-    lookback = c2.number_input("Look back (bars)", 0, 10, 3, key="ich_lookback",
-                               help="Report TK crosses, cloud breaks and twists whose trigger was within this many bars.")
-    c3.write("")
-    run_it = c3.button("Run screener", key="ich_run")
+    interval, tf_label = dtab.pick_timeframe(c2, "ich_tf")
+    lookback = c3.number_input("Look back (bars)", 0, 10, 3, key="ich_lookback",
+                               help="Report TK crosses, cloud breaks and twists whose trigger was within this many bars "
+                                    "of the selected timeframe.")
+    c4.write("")
+    run_it = c4.button("Run screener", key="ich_run")
     custom = ""
     if universe == "My tickers":
         custom = st.text_area("Tickers (comma, space or newline separated)",
@@ -113,9 +137,10 @@ def render(show_vega=None):
                 bar.progress(min(done / max(total, 1), 1.0), text=f"{done}/{total} tickers")
 
             try:
-                res = isc.run(tickers, lookback=int(lookback), out=None, verbose=False, progress=cb)
+                res = isc.run(tickers, lookback=int(lookback), out=None, verbose=False, progress=cb, interval=interval)
                 st.session_state["ich_res"] = res
                 st.session_state["ich_when"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+                st.session_state["ich_tf_label"] = tf_label
             except ImportError as e:
                 st.error(f"Missing package: {e}. Add yfinance and lxml to requirements.txt and reboot the app.")
             except Exception as e:
@@ -129,7 +154,9 @@ def render(show_vega=None):
         return
 
     meta = res.attrs
-    st.caption(f"Scanned {meta.get('n_tickers', '?')} tickers at {st.session_state.get('ich_when', '')} | "
+    res_interval = meta.get("interval", "1d")           # the timeframe these results were scanned on (not the selector's current value)
+    res_label = st.session_state.get("ich_tf_label", "Daily")
+    st.caption(f"{res_label} bars | scanned {meta.get('n_tickers', '?')} tickers at {st.session_state.get('ich_when', '')} | "
                f"no data/errors: {len(meta.get('failed', []))} | too little history (<{meta.get('min_rows', isc.MIN_ROWS)} bars): "
                f"{len(meta.get('short', []))}")
     if meta.get("failed"):
@@ -166,16 +193,18 @@ def render(show_vega=None):
     choice = st.selectbox("Ticker", labels, key="ich_pick")
     row = view.iloc[labels.index(choice)]
     try:
-        start = (dt.date.today() - dt.timedelta(days=900)).isoformat()
-        raw = dtab._one(row["ticker"], start)
+        raw = dtab._one(row["ticker"], dsc.default_start(res_interval), res_interval)
         if raw is None or raw.empty:
             raise ValueError("no price data returned")
-        d = isc.add_indicators(dsc.drop_partial_bar(raw))
-        dtab._show_vega(candle_spec(d), show_vega)
+        d = isc.add_indicators(dsc.drop_partial_bar(raw, interval=res_interval))
+        shown = 120 if res_interval == "1d" else 200
+        dtab._show_vega(candle_spec(d, days=shown), show_vega)
+        ahead = "26 sessions ahead (weekends skipped, exchange holidays ignored)" if res_interval == "1d" else \
+            "26 hourly bars ahead (weekends skipped, exchange holidays ignored)"
         st.caption(":blue[Tenkan (9)]  :orange[Kijun (26)]  :green[Senkou A]  :red[Senkou B]; shaded = cloud (green bullish, red bearish), "
-                   "extended 26 sessions ahead (weekends skipped, exchange holidays ignored). "
+                   f"extended {ahead}. "
                    f"ADX {d['adx'].iloc[-1]:.1f}, ATR {d['atr'].iloc[-1]:.2f} ({100 * d['atr'].iloc[-1] / d['Close'].iloc[-1]:.2f}% of price).")
-        st.line_chart(d["adx"].tail(120).rename("ADX(14)").to_frame(), height=140)
+        st.line_chart(d["adx"].tail(shown).rename("ADX(14)").to_frame(), height=140)
         st.caption(f"Why: {row['note']}")
     except ImportError as e:
         st.error(f"Missing package: {e}. Add yfinance to requirements.txt and reboot the app.")
@@ -192,3 +221,8 @@ def _notes():
                     "extension thresholds are starting values, not tuned. Unlike the Donchian screener's notes, nothing here has "
                     "been backtested yet, so treat grades as a ranking of how many conditions line up, not a forecast. Cloud "
                     "signals lag by construction, and a break out of a thick cloud comes with a wide stop.")
+        st.markdown("**1-hour mode.** Every period (9 / 26 / 52, ATR, ADX, the 20-bar volume average, 'bars ago', 'look back') then "
+                    "counts hourly bars, about 7 per session, so the cloud spans roughly 4 sessions ahead and Kijun about 4 sessions "
+                    "back. Hourly volume is lumpy (heavy at the open and close), so the volume check is noisier than on daily bars. "
+                    "Bars run 09:30-15:30 New York time, the forming hour is dropped, and Yahoo limits hourly history, so this "
+                    "app requests about 150 days.")

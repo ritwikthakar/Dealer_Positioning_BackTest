@@ -15,6 +15,7 @@ Wilder ATR/ADX. Output is a candidate list, not validated trade signals.
 """
 import argparse
 import datetime as dt
+import functools
 import sys
 
 import numpy as np
@@ -95,11 +96,12 @@ def scan_symbol(d, sym, lookback=3, pb_bars=15, sq_pct=0.15, adx_min=20):
     f = compute_flags(d, pb_bars, sq_pct, adx_min)
     c = d["Close"]
     rows = []
+    intraday = is_intraday(d.index)
 
     def base(i, setup, side, grade, level, stop, note, extra=None):
         r = d.iloc[i]
         row = dict(ticker=sym, setup=setup, side=side, grade=grade, bars_ago=len(d) - 1 - i,
-                   date=d.index[i].date(), close=round(r["Close"], 2), level=round(level, 2) if np.isfinite(level) else np.nan,
+                   date=bar_stamp(d.index[i], intraday), close=round(r["Close"], 2), level=round(level, 2) if np.isfinite(level) else np.nan,
                    dist_atr=round((r["Close"] - level) / r["atr"], 2) if np.isfinite(level) else np.nan,
                    stop=round(stop, 2) if np.isfinite(stop) else np.nan, adx=round(r["adx"], 1),
                    atr=round(r["atr"], 2), atr_pct=round(100 * r["atr"] / r["Close"], 2), note=note)
@@ -226,29 +228,65 @@ def extract(raw, t):
     return df[~df.index.duplicated()].sort_index()
 
 
-def drop_partial_bar(df, now=None):
-    """Drop today's bar if the US market is still open (daily bar not final)."""
+INTERVALS = {"Daily": "1d", "1 hour": "1h"}      # label shown in the app -> yfinance interval
+# calendar days of history to request per interval. Yahoo serves 1h bars for the last 730 days only; 150 days is about
+# 100 sessions (~700 bars), enough for the 260-bar minimum of this screener and the 150 of the Ichimoku one.
+START_DAYS = {"1d": 900, "1h": 150}
+
+
+def default_start(interval="1d"):
+    return (dt.date.today() - dt.timedelta(days=START_DAYS.get(interval, 900))).isoformat()
+
+
+def is_intraday(index):
+    """True when the bar timestamps carry a time of day (anything but midnight)."""
+    return len(index) > 0 and bool((index != index.normalize()).any())
+
+
+def bar_stamp(ts, intraday=False):
+    """Date for daily bars; 'YYYY-MM-DD HH:MM' (New York time) for intraday bars."""
+    if not intraday:
+        return ts.date()
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("America/New_York")
+    return ts.strftime("%Y-%m-%d %H:%M")
+
+
+def drop_partial_bar(df, now=None, interval="1d"):
+    """Drop the latest bar if it is still forming: today's daily bar while the US market is open, or an intraday bar
+    whose hour (capped at the 16:00 close) has not finished yet."""
     try:
         from zoneinfo import ZoneInfo
-        now = now or dt.datetime.now(ZoneInfo("America/New_York"))
+        ny = ZoneInfo("America/New_York")
+        now = now or dt.datetime.now(ny)
     except Exception:
         return df
-    if len(df) and df.index[-1].date() == now.date() and (now.weekday() < 5 and now.time() < dt.time(16, 10)):
-        return df.iloc[:-1]
-    return df
+    if not len(df):
+        return df
+    if interval == "1d":
+        if df.index[-1].date() == now.date() and (now.weekday() < 5 and now.time() < dt.time(16, 10)):
+            return df.iloc[:-1]
+        return df
+    last = df.index[-1]
+    last = last.tz_localize(ny) if last.tzinfo is None else last.tz_convert(ny)
+    end = min(last + pd.Timedelta(interval), last.replace(hour=16, minute=0, second=0, microsecond=0))
+    now_ts = pd.Timestamp(now)
+    now_ts = now_ts.tz_localize(ny) if now_ts.tzinfo is None else now_ts.tz_convert(ny)
+    return df.iloc[:-1] if end > now_ts else df
 
 
-def yf_loader(tickers, start):
+def yf_loader(tickers, start, interval="1d"):
     import yfinance as yf
-    return yf.download(tickers, start=start, auto_adjust=True, group_by="ticker", threads=True, progress=False)
+    return yf.download(tickers, start=start, interval=interval, auto_adjust=True, group_by="ticker", threads=True,
+                       progress=False)
 
 
 # ---------------------------------------------------------------- driver
 def run(tickers=None, lookback=3, out="donchian_setups.csv", start=None, chunk=80, loader=None, min_rows=260, verbose=True,
-        progress=None):
+        progress=None, interval="1d"):
     tickers = tickers or get_sp500_tickers()
-    start = start or (dt.date.today() - dt.timedelta(days=900)).isoformat()
-    loader = loader or yf_loader
+    start = start or default_start(interval)
+    loader = loader or functools.partial(yf_loader, interval=interval)     # a custom loader is still called as loader(part, start)
     sigs, failed, short = [], [], []
     for s in range(0, len(tickers), chunk):
         part = tickers[s:s + chunk]
@@ -268,7 +306,7 @@ def run(tickers=None, lookback=3, out="donchian_setups.csv", start=None, chunk=8
                 if df is None or df.empty:
                     failed.append(t)
                     continue
-                df = drop_partial_bar(df)
+                df = drop_partial_bar(df, interval=interval)
                 if len(df) < min_rows:
                     short.append(t)
                     continue
@@ -279,7 +317,7 @@ def run(tickers=None, lookback=3, out="donchian_setups.csv", start=None, chunk=8
     if progress:
         progress(len(tickers), len(tickers))
     res = pd.DataFrame(sigs)
-    res.attrs.update(failed=failed, short=short, n_tickers=len(tickers))
+    res.attrs.update(failed=failed, short=short, n_tickers=len(tickers), interval=interval)
     if not res.empty:
         order = {"breakout": 0, "pullback": 1, "squeeze_break": 2, "squeeze": 3, "failed_break": 4}
         res["_o"] = res["setup"].map(order)
@@ -305,8 +343,9 @@ def main(argv=None):
     ap.add_argument("tickers", nargs="*")
     ap.add_argument("--lookback", type=int, default=3)
     ap.add_argument("--out", default="donchian_setups.csv")
+    ap.add_argument("--interval", default="1d", choices=sorted(INTERVALS.values()), help="bar size: 1d (default) or 1h")
     a, _ = ap.parse_known_args(argv)                  # tolerate Colab/Jupyter's extra -f argument
-    run(a.tickers or None, lookback=a.lookback, out=a.out)
+    run(a.tickers or None, lookback=a.lookback, out=a.out, interval=a.interval)
     return 0
 
 

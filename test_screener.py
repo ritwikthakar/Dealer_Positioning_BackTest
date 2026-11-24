@@ -143,6 +143,57 @@ shut_t = dt.datetime.combine(today, dt.time(17, 0), ZoneInfo("America/New_York")
 assert len(sc.drop_partial_bar(x, open_t)) == 9 and len(sc.drop_partial_bar(x, shut_t)) == 10
 print("7 extract (both column orders), single frame, partial bar ok")
 
+# ---- 7b. 1-hour bars: forming-hour guard, stamps, loader interval, default start
+NY = ZoneInfo("America/New_York")
+def hourly(day, n_bars=7, tz=NY):
+    idx = pd.DatetimeIndex([pd.Timestamp(day) + pd.Timedelta(hours=9.5 + k) for k in range(n_bars)])
+    idx = idx.tz_localize(tz) if tz else idx
+    return pd.DataFrame({"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5, "Volume": 1e6}, index=idx)
+day = pd.Timestamp("2026-11-24")                                               # a Tuesday
+h = hourly(day)                                                                # bars start 09:30 ... 15:30
+at_ = lambda hh, mm, d=day: dt.datetime(d.year, d.month, d.day, hh, mm, tzinfo=NY)
+# the 10:30 bar (index 1) ends 11:30; the 15:30 bar ends at the 16:00 close, not 16:30
+assert len(sc.drop_partial_bar(h.iloc[:2], at_(11, 29), interval="1h")) == 1          # 10:30 bar still forming: dropped
+assert len(sc.drop_partial_bar(h.iloc[:2], at_(11, 31), interval="1h")) == 2          # finished: kept
+assert len(sc.drop_partial_bar(h, at_(15, 59), interval="1h")) == 6
+assert len(sc.drop_partial_bar(h, at_(16, 1), interval="1h")) == 7                    # kept right after the close
+assert len(sc.drop_partial_bar(h, at_(9, 0, day + pd.Timedelta(days=1)), interval="1h")) == 7   # next morning
+assert len(sc.drop_partial_bar(hourly(day, tz=None), at_(11, 0), interval="1h")) == 6    # naive index is read as New York time
+assert len(sc.drop_partial_bar(hourly(day, tz=None).iloc[:2], at_(11, 29), interval="1h")) == 1
+assert len(sc.drop_partial_bar(h, at_(11, 0, pd.Timestamp("2026-11-28")), interval="1h")) == 7  # Saturday: nothing forming
+assert len(sc.drop_partial_bar(h.iloc[:0], interval="1h")) == 0                       # empty frame is fine
+# daily behaviour is untouched by the new keyword
+assert len(sc.drop_partial_bar(x, open_t, interval="1d")) == 9 and len(sc.drop_partial_bar(x, shut_t)) == 10
+# stamps and intraday detection
+assert sc.is_intraday(h.index) and not sc.is_intraday(x.index) and not sc.is_intraday(x.index[:0])
+assert sc.bar_stamp(h.index[1], True) == "2026-11-24 10:30" and sc.bar_stamp(h.index[1].tz_convert("UTC"), True) == "2026-11-24 10:30"
+assert sc.bar_stamp(x.index[0]) == x.index[0].date()
+# loader passes the interval to yfinance; default start window depends on the interval
+import types
+seen_kw = {}
+fy = types.ModuleType("yfinance"); fy.download = lambda tickers, **k: seen_kw.update(k) or pd.DataFrame()
+sys.modules["yfinance"] = fy
+sc.yf_loader(["AAA"], "2026-01-01"); assert seen_kw["interval"] == "1d" and seen_kw["start"] == "2026-01-01"
+sc.yf_loader(["AAA"], "2026-01-01", "1h"); assert seen_kw["interval"] == "1h"
+del sys.modules["yfinance"]
+assert (dt.date.today() - dt.date.fromisoformat(sc.default_start("1d"))).days == 900
+assert (dt.date.today() - dt.date.fromisoformat(sc.default_start("1h"))).days == 150 < 730
+# run(interval="1h") with a fake hourly loader: custom loaders keep the (tickers, start) signature
+def fake_h(tickers, start):
+    assert start == sc.default_start("1h"), start
+    days = pd.bdate_range(end=pd.Timestamp("2026-11-20"), periods=70)
+    frames = {}
+    for t in tickers:
+        c = 100 * np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.004, 70 * 7)))
+        fr = pd.concat([hourly(d_) for d_ in days])
+        fr["Close"] = c; fr["Open"] = np.r_[c[0], c[:-1]]; fr["High"] = np.maximum(fr.Open, c) + 0.3; fr["Low"] = np.minimum(fr.Open, c) - 0.3
+        frames[t] = fr
+    return pd.concat(frames, axis=1)
+rh = sc.run(["AAA", "BBB"], lookback=3, out=None, verbose=False, loader=fake_h, interval="1h")
+assert rh.attrs["interval"] == "1h" and rh.attrs["short"] == [] and rh.attrs["failed"] == []
+assert rh.empty or all(isinstance(s, str) and len(s) == 16 for s in rh["date"])
+print("7b 1-hour: forming-hour guard, stamps, loader interval, default start, run(interval='1h') ok")
+
 # ---- 8. end-to-end with a fake loader, short history, missing ticker, CSV
 rng = np.random.default_rng(7)
 def fake(tickers, start):

@@ -34,10 +34,35 @@ def parse_tickers(text):
     return out
 
 
+TF_LABELS = ["Daily", "1 hour"]                 # shown in the timeframe selector; mapped to yfinance intervals by sc.INTERVALS
+TF_BARS = {"1d": "days", "1h": "hours"}         # what one bar is, for captions
+
+
+def stamp_labels(index):
+    """'MM-DD HH:MM' (New York time) labels for intraday bar timestamps."""
+    idx = index.tz_convert("America/New_York") if getattr(index, "tz", None) is not None else index
+    return list(idx.strftime("%m-%d %H:%M"))
+
+
+def x_encoding(labels=None, fmt="%b %d"):
+    """Vega-Lite x encoding and the tooltip's date field. Daily bars (labels=None) use a temporal axis. Intraday bars use an
+    ordinal axis over `labels` in time order, so overnight and weekend gaps do not stretch the chart."""
+    if labels is None:
+        return ({"field": "date", "type": "temporal", "axis": {"title": None, "format": fmt, "labelOverlap": True}},
+                {"field": "date", "type": "temporal", "title": "Date", "format": "%Y-%m-%d"})
+    step = max(1, len(labels) // 10)
+    xe = {"field": "date", "type": "ordinal", "scale": {"domain": labels},
+          "axis": {"title": None, "labelOverlap": True, "labelAngle": -45, "values": labels[::step]}}
+    return xe, {"field": "date", "type": "ordinal", "title": "Time (ET)"}
+
+
 def candle_spec(d, days=120, height=380):
-    """Candles with 20-day Donchian high/low and the 200 EMA, from sc.add_indicators output."""
+    """Candles with 20-day Donchian high/low and the 200 EMA, from sc.add_indicators output.
+    Works for daily and intraday frames (intraday timestamps switch the x axis to bar labels)."""
+    import donchian_screener as sc
     x = d.tail(days).copy()
-    x["date"] = x.index
+    intraday = sc.is_intraday(x.index)
+    x["date"] = stamp_labels(x.index) if intraday else x.index
     cols = ["date", "Open", "High", "Low", "Close", "hi", "lo", "ema"]
     recs = json.loads(x[cols].rename(columns=str.lower).to_json(orient="records", date_format="iso"))
     vals = x[["Low", "hi", "lo", "ema"]].to_numpy(dtype=float)
@@ -45,10 +70,10 @@ def candle_spec(d, days=120, height=380):
     lo, hi = float(np.nanmin(vals)), float(np.nanmax(top))
     pad = (hi - lo) * 0.03 or 1.0
     dom = [lo - pad, hi + pad]
-    xe = {"field": "date", "type": "temporal", "axis": {"title": None, "format": "%b %d", "labelOverlap": True}}
+    xe, tip_date = x_encoding(list(x["date"]) if intraday else None)
     ye = lambda f: {"field": f, "type": "quantitative", "scale": {"zero": False, "domain": dom}, "axis": {"title": None}}
     color = {"condition": {"test": "datum.close >= datum.open", "value": "#26a69a"}, "value": "#ef5350"}
-    tip = [{"field": "date", "type": "temporal", "title": "Date", "format": "%Y-%m-%d"}] + [
+    tip = [tip_date] + [
         {"field": f, "type": "quantitative", "title": f.title(), "format": ".2f"} for f in ("open", "high", "low", "close")]
     bar = int(max(2, min(9, 650 / max(len(x), 1) * 0.7)))
     layers = [
@@ -78,10 +103,19 @@ def _sp500():
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def _one(ticker, start):
+def _one(ticker, start, interval="1d"):
     import donchian_screener as sc
-    raw = sc.yf_loader([ticker], start)
+    raw = sc.yf_loader([ticker], start, interval)
     return sc.extract(raw, ticker)
+
+
+def pick_timeframe(col, key):
+    """Timeframe selectbox. Returns (yfinance interval, label)."""
+    import donchian_screener as sc
+    label = col.selectbox("Timeframe", TF_LABELS, key=key,
+                          help="Daily bars, or 1-hour bars (Yahoo serves about the last 2 years of hourly data; this app asks "
+                               "for ~150 days). 'Look back' and every indicator period are counted in bars of the chosen timeframe.")
+    return sc.INTERVALS[label], label
 
 
 def render(show_vega=None):
@@ -93,14 +127,16 @@ def render(show_vega=None):
 
     st.subheader("Donchian setup screener")
     st.caption("Four setups, both directions, graded with ADX and ATR. Channels use the PRIOR bars only. "
-               "Daily data from Yahoo Finance via yfinance; the last bar is dropped while the US market is open. "
+               "Daily or 1-hour data from Yahoo Finance via yfinance; the latest bar is dropped until it has finished. "
                "Candidate list for review, not trade signals.")
-    c1, c2, c3 = st.columns([2, 1, 1])
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     universe = c1.radio("Universe", ["S&P 500", "My tickers"], horizontal=True, key="scr_universe")
-    lookback = c2.number_input("Look back (bars)", 0, 10, 3, key="scr_lookback",
-                               help="Report breakouts, squeeze breaks and failures whose trigger was within this many bars.")
-    c3.write("")
-    run_it = c3.button("Run screener", key="scr_run")
+    interval, tf_label = pick_timeframe(c2, "scr_tf")
+    lookback = c3.number_input("Look back (bars)", 0, 10, 3, key="scr_lookback",
+                               help="Report breakouts, squeeze breaks and failures whose trigger was within this many bars "
+                                    "of the selected timeframe.")
+    c4.write("")
+    run_it = c4.button("Run screener", key="scr_run")
     custom = ""
     if universe == "My tickers":
         custom = st.text_area("Tickers (comma, space or newline separated)", value="QQQ, SPY, AAPL, NVDA", key="scr_tickers")
@@ -120,9 +156,10 @@ def render(show_vega=None):
                 bar.progress(min(done / max(total, 1), 1.0), text=f"{done}/{total} tickers")
 
             try:
-                res = sc.run(tickers, lookback=int(lookback), out=None, verbose=False, progress=cb)
+                res = sc.run(tickers, lookback=int(lookback), out=None, verbose=False, progress=cb, interval=interval)
                 st.session_state["scr_res"] = res
                 st.session_state["scr_when"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+                st.session_state["scr_tf_label"] = tf_label
             except ImportError as e:
                 st.error(f"Missing package: {e}. Add yfinance and lxml to requirements.txt and reboot the app.")
             except Exception as e:
@@ -136,7 +173,9 @@ def render(show_vega=None):
         return
 
     meta = res.attrs
-    st.caption(f"Scanned {meta.get('n_tickers', '?')} tickers at {st.session_state.get('scr_when', '')} | "
+    res_interval = meta.get("interval", "1d")           # the timeframe these results were scanned on (not the selector's current value)
+    res_label = st.session_state.get("scr_tf_label", "Daily")
+    st.caption(f"{res_label} bars | scanned {meta.get('n_tickers', '?')} tickers at {st.session_state.get('scr_when', '')} | "
                f"no data/errors: {len(meta.get('failed', []))} | too little history (<260 bars): {len(meta.get('short', []))}")
     if meta.get("failed"):
         st.caption("No data: " + ", ".join(meta["failed"][:20]) + (" ..." if len(meta["failed"]) > 20 else ""))
@@ -172,13 +211,13 @@ def render(show_vega=None):
     choice = st.selectbox("Ticker", labels, key="scr_pick")
     row = view.iloc[labels.index(choice)]
     try:
-        start = (dt.date.today() - dt.timedelta(days=900)).isoformat()
-        raw = _one(row["ticker"], start)
+        raw = _one(row["ticker"], sc.default_start(res_interval), res_interval)
         if raw is None or raw.empty:
             raise ValueError("no price data returned")
-        d = sc.add_indicators(sc.drop_partial_bar(raw))
-        _show_vega(candle_spec(d), show_vega)
-        st.caption(":orange[Prior 20-day high (solid) and low (dashed)]  :blue[200 EMA]. "
+        d = sc.add_indicators(sc.drop_partial_bar(raw, interval=res_interval))
+        _show_vega(candle_spec(d, days=120 if res_interval == "1d" else 200), show_vega)
+        unit = "bar" if res_interval != "1d" else "day"
+        st.caption(f":orange[Prior 20-{unit} high (solid) and low (dashed)]  :blue[200 EMA]. "
                    f"ADX {d['adx'].iloc[-1]:.1f}, ATR {d['atr'].iloc[-1]:.2f} ({100 * d['atr'].iloc[-1] / d['Close'].iloc[-1]:.2f}% of price).")
         st.line_chart(d["adx"].tail(120).rename("ADX(14)").to_frame(), height=140)
         st.caption(f"Why: {row['note']}")
@@ -196,4 +235,9 @@ def _notes():
         st.markdown("**Caveat.** Thresholds (ADX 20/25, 1.5 ATR, 2-point ADX fade, 15% squeeze percentile) are starting "
                     "values, not tuned. On the QQQ history, fading failed up-breakouts showed no edge at 5-10 days, and the "
                     "gamma flip was present in almost every failure, so it did not separate good from bad. Treat grades as a ranking of "
-                    "how clean the setup looks, not a forecast.")
+                    "how clean the setup looks, not a forecast. Those notes are from daily bars; the screener has not been "
+                    "validated on 1-hour bars.")
+        st.markdown("**1-hour mode.** Every period (20 / 55-bar channels, 200 EMA, ATR, ADX, 'bars ago', 'look back') then counts "
+                    "hourly bars, about 7 per session, so the 200 EMA spans roughly 29 sessions and the 20-bar channel under 3. "
+                    "Hourly volume is lumpy (heavy at the open and close), so the volume check is noisier than on daily bars. "
+                    "The forming hour is dropped, and Yahoo limits hourly history, so this app requests about 150 days.")

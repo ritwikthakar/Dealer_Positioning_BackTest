@@ -106,6 +106,51 @@ LOG["infos"].clear(); LOG["frames"].clear(); OV.update(scr_f_setup=[])
 tab.render(); assert any("matches" in t for t in LOG["infos"]) and not LOG["frames"]
 print("3 filters and empty-filter message ok")
 
+# ---- 3b. 1-hour timeframe: the selector reaches the downloader, results and chart stay on the scanned timeframe
+import re
+def mk_hourly(closes, spread=0.6):
+    c = np.asarray(closes, float); o = np.r_[c[0], c[:-1]]
+    days = pd.bdate_range(end=pd.Timestamp.today().normalize() - pd.Timedelta(days=3), periods=len(c) // 7 + 2)
+    stamps = [d + pd.Timedelta(hours=9.5 + k) for d in days for k in range(7)][-len(c):]
+    idx = pd.DatetimeIndex(stamps).tz_localize("America/New_York")
+    return pd.DataFrame({"Open": o, "High": np.maximum(c, o) + spread, "Low": np.minimum(c, o) - spread, "Close": c,
+                         "Volume": 1e6}, index=idx)
+CALLS = []
+def download_h(tickers, start=None, interval="1d", **k):
+    CALLS.append((list(tickers), start, interval))
+    if interval != "1h":
+        return download(tickers, start, **k)
+    return pd.concat({t: mk_hourly([100 + 0.2 * (i % 3) for i in range(400)] + [104, 99.0] if t == "FAIL"
+                                   else 100 * np.exp(np.cumsum(rng.normal(0.0003, 0.004, 420))))
+                      for t in tickers if t != "NODATA"}, axis=1)
+yf.download = download_h
+OV.clear(); st.session_state.clear()
+for k_ in ("errors", "infos", "frames", "vega", "texts", "progress"): LOG[k_].clear()
+OV.update(scr_run=True, scr_universe="My tickers", scr_tickers="FAIL, NODATA, " + ", ".join("H%d" % i for i in range(10)),
+          scr_tf=1, scr_lookback=3)
+tab.render()
+assert not LOG["errors"], LOG["errors"]
+res = st.session_state["scr_res"]
+assert res.attrs["interval"] == "1h" and res.attrs["failed"] == ["NODATA"]
+assert CALLS[0][2] == "1h" and CALLS[0][1] == sc.default_start("1h"), CALLS[0]
+fb = res[(res.ticker == "FAIL") & (res.setup == "failed_break")]
+assert len(fb) == 1 and fb.iloc[0]["side"] == "short", res[res.ticker == "FAIL"]
+assert all(re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d", s) for s in res["date"]), res["date"].head()
+assert CALLS[-1][2] == "1h" and len(CALLS[-1][0]) == 1, CALLS[-1]          # the drill-down chart asked for hourly bars too
+assert any(t.startswith("1 hour bars |") for t in LOG["texts"]), [t for t in LOG["texts"] if "canned" in t]
+spec = LOG["vega"][-1]
+xe = spec["layer"][0]["encoding"]["x"]
+assert xe["type"] == "ordinal" and len(spec["data"]["values"]) == 200 and len(set(xe["scale"]["domain"])) == 200
+assert [r["date"] for r in spec["data"]["values"]] == xe["scale"]["domain"]
+n_calls = len(CALLS); OV.update(scr_run=False, scr_tf=0); LOG["vega"].clear()          # selector change alone must not change the chart
+tab.render()
+assert CALLS[n_calls:] and all(c[2] == "1h" for c in CALLS[n_calls:]) and len(LOG["vega"]) == 1
+OV.update(scr_run=True, scr_tf=0); LOG["vega"].clear(); tab.render()
+assert st.session_state["scr_res"].attrs["interval"] == "1d" and CALLS[-1][2] == "1d" and not LOG["errors"], CALLS[-1]
+assert LOG["vega"][-1]["layer"][0]["encoding"]["x"]["type"] == "temporal"
+yf.download = download
+print("3b 1-hour: interval reaches the downloader, hourly stamps, ordinal chart, daily unaffected")
+
 # ---- 4. empty result, S&P path failure, missing package, drill-down failure
 OV.clear(); st.session_state.clear(); LOG["errors"].clear(); LOG["infos"].clear()
 OV.update(scr_run=True, scr_universe="My tickers", scr_tickers="NODATA")

@@ -127,6 +127,61 @@ LOG["infos"].clear(); LOG["frames"].clear(); OV.update(ich_f_setup=[])
 tab.render(); assert any("matches" in t for t in LOG["infos"]) and not LOG["frames"]
 print("4 filters and empty-filter message ok")
 
+# ---- 4b. 1-hour timeframe: the selector reaches the downloader, results and chart stay on the scanned timeframe
+import re
+def mk_hourly(closes, spread=0.3):
+    c = np.asarray(closes, float); o = np.r_[c[0], c[:-1]]
+    days = pd.bdate_range(end=pd.Timestamp.today().normalize() - pd.Timedelta(days=3), periods=len(c) // 7 + 2)
+    stamps = [d + pd.Timedelta(hours=9.5 + k) for d in days for k in range(7)][-len(c):]
+    idx = pd.DatetimeIndex(stamps).tz_localize("America/New_York")
+    return pd.DataFrame({"Open": o, "High": np.maximum(c, o) + spread, "Low": np.minimum(c, o) - spread, "Close": c,
+                         "Volume": 1e6}, index=idx)
+CALLS = []
+def download_h(tickers, start=None, interval="1d", **k):
+    CALLS.append((list(tickers), start, interval))
+    if interval != "1h":
+        return download(tickers, start, **k)
+    return pd.concat({t: mk_hourly(TURN if t == "TURN" else 100 * np.exp(np.cumsum(rng.normal(0.0003, 0.004, 450))))
+                      for t in tickers if t != "NODATA"}, axis=1)
+yf.download = download_h
+OV.clear(); st.session_state.clear()
+for k_ in ("errors", "infos", "frames", "vega", "texts", "dl", "progress"): LOG[k_].clear()
+OV.update(ich_run=True, ich_universe="My tickers", ich_tickers="TURN, NODATA, " + ", ".join("H%d" % i for i in range(10)),
+          ich_tf=1, ich_lookback=6)
+tab.render()
+assert not LOG["errors"], LOG["errors"]
+res = st.session_state["ich_res"]
+assert res.attrs["interval"] == "1h" and res.attrs["failed"] == ["NODATA"]
+assert CALLS[0][2] == "1h" and CALLS[0][1] == dsc.default_start("1h"), CALLS[0]
+cb = res[(res.ticker == "TURN") & (res.setup == "cloud_break")]
+assert len(cb) == 1 and cb.iloc[0]["side"] == "long" and cb.iloc[0]["bars_ago"] == 5, res[res.ticker == "TURN"]
+assert all(re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d", s) for s in res["date"]), res["date"].head()
+assert CALLS[-1][2] == "1h" and len(CALLS[-1][0]) == 1, CALLS[-1]          # the drill-down chart asked for hourly bars too
+assert any(t.startswith("1 hour bars |") for t in LOG["texts"]), [t for t in LOG["texts"] if "Scanned" in t or "scanned" in t]
+spec = LOG["vega"][-1]
+xe = spec["layer"][3]["encoding"]["x"]
+assert xe["type"] == "ordinal" and len(spec["data"]["values"]) == 200 and len(xe["scale"]["domain"]) == 226
+dom = xe["scale"]["domain"]
+assert dom == sorted(dom, key=lambda s: dom.index(s)) and len(set(dom)) == 226
+assert [r["date"] for r in spec["data"]["values"]] == dom[:200]
+cl = spec["layer"][0]["data"]["values"]
+assert all(r["date"] in dom for r in cl) and sum(1 for r in cl if r["date"] in dom[200:]) == 26
+yr, prev, fut_ts = mk_hourly(TURN).index[-1].year, 0, []          # labels carry no year: rebuild it, rolling over in January
+for s in dom[200:]:
+    mo = int(s[:2]); yr += mo < prev; prev = mo
+    fut_ts.append(pd.Timestamp(f"{yr}-{s}"))
+assert all(t.weekday() < 5 and 9 <= t.hour <= 15 and t.minute == 30 for t in fut_ts) and fut_ts == sorted(fut_ts)
+# changing the selector without pressing Run must not change what the existing results/chart use
+n_calls = len(CALLS); OV.update(ich_run=False, ich_tf=0); LOG["vega"].clear()
+tab.render()
+assert CALLS[n_calls:] and all(c[2] == "1h" for c in CALLS[n_calls:]) and len(LOG["vega"]) == 1
+# daily still works from the same selector
+OV.update(ich_run=True, ich_tf=0); LOG["vega"].clear(); tab.render()
+assert st.session_state["ich_res"].attrs["interval"] == "1d" and CALLS[-1][2] == "1d" and not LOG["errors"], CALLS[-1]
+assert LOG["vega"][-1]["layer"][3]["encoding"]["x"]["type"] == "temporal"
+yf.download = download
+print("4b 1-hour: interval reaches the downloader, hourly stamps, ordinal chart with 26 projected session bars, daily unaffected")
+
 # ---- 5. empty result, S&P path failure, missing package
 OV.clear(); st.session_state.clear(); LOG["errors"].clear(); LOG["infos"].clear()
 OV.update(ich_run=True, ich_universe="My tickers", ich_tickers="NODATA")
