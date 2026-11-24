@@ -393,12 +393,13 @@ with tab_over:
             with g_left:
                 st.caption("Not enough GEX history in the history file to draw the gauge (needs 30+ sessions).")
         else:
-            svg = core.gex_gauge_svg(gi)
+            try:                                   # needle / text colour must match the active theme
+                fg = "#fafafa" if st.context.theme.type == "dark" else "#1f2328"
+            except Exception:
+                fg = "#9aa0a6"                     # neutral grey readable on both themes
+            svg = core.gex_gauge_svg(gi, fg=fg)
             with g_left:
-                if hasattr(st, "html"):
-                    st.html(f'<div style="color:inherit">{svg}</div>')
-                else:
-                    st.markdown(svg, unsafe_allow_html=True)
+                st.image(svg, width=320)           # st.image takes an SVG string; st.html / markdown strip <svg>
             with g_right:
                 st.markdown(f"**{gi['label']}**")
                 st.caption(gi["meaning"])

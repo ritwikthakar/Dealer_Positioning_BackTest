@@ -938,8 +938,11 @@ def gex_intensity(series: pd.Series, window: int | None = 252, min_obs: int = 30
             "hist_min": lo, "hist_max": hi, "n": int(len(win)), "meaning": meaning}
 
 
-def gex_gauge_svg(gi: dict, size: int = 300) -> str:
-    """Semicircle gauge as one self-contained SVG string (left = most negative GEX, right = most positive)."""
+def gex_gauge_svg(gi: dict, size: int = 300, fg: str = "#9aa0a6") -> str:
+    """Semicircle gauge as one self-contained SVG string (left = most negative GEX, right = most positive).
+
+    `fg` is the needle and text colour; it must be explicit because the SVG is shown through <img>, where
+    currentColor would always resolve to black (unreadable on a dark theme)."""
     cx, cy, ro, ri = 150.0, 140.0, 118.0, 80.0
 
     def pt(score, r):
@@ -958,16 +961,16 @@ def gex_gauge_svg(gi: dict, size: int = 300) -> str:
                      f'A{ri},{ri} 0 0 0 {x4:.1f},{y4:.1f} Z" fill="{col}" stroke="#ffffff" stroke-opacity="0.55" '
                      f'stroke-width="1"><title>{name}</title></path>')
     nx, ny = pt(gi["score"], ro - 8)
-    parts.append(f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" stroke="currentColor" stroke-width="3.5" '
+    parts.append(f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" stroke="{fg}" stroke-width="3.5" '
                  'stroke-linecap="round"/>')
-    parts.append(f'<circle cx="{cx}" cy="{cy}" r="7" fill="currentColor"/>')
+    parts.append(f'<circle cx="{cx}" cy="{cy}" r="7" fill="{fg}"/>')
     mid = (ro + ri) / 2.0
     for tx, ty, txt in ((cx - mid, cy + 15, "-100"), (cx, pt(0, ro + 6)[1], "0"), (cx + mid, cy + 15, "+100")):
-        parts.append(f'<text x="{tx:.1f}" y="{ty:.1f}" font-size="11" fill="currentColor" fill-opacity="0.7" '
+        parts.append(f'<text x="{tx:.1f}" y="{ty:.1f}" font-size="11" fill="{fg}" fill-opacity="0.7" '
                      f'text-anchor="middle">{txt}</text>')
-    parts.append(f'<text x="{cx}" y="177" font-size="26" font-weight="700" fill="currentColor" '
+    parts.append(f'<text x="{cx}" y="177" font-size="26" font-weight="700" fill="{fg}" '
                  f'text-anchor="middle">{gi["score"]:+.0f}</text>')
-    parts.append(f'<text x="{cx}" y="194" font-size="12" fill="currentColor" fill-opacity="0.8" '
+    parts.append(f'<text x="{cx}" y="194" font-size="12" fill="{fg}" fill-opacity="0.8" '
                  f'text-anchor="middle">{gi["label"]}</text>')
     parts.append("</svg>")
     return "".join(parts)
