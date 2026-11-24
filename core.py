@@ -20,7 +20,7 @@ import pandas as pd
 
 import vanna_charm
 
-CORE_VERSION = "2026-11-22.1"   # app.py refuses to run against a core.py with a different stamp
+CORE_VERSION = "2026-11-23.1"   # app.py refuses to run against a core.py with a different stamp
 
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
@@ -885,6 +885,94 @@ def trend_card(series: pd.Series, short: int = 5, long: int = 20, z_window: int 
             "tail": s.tail(60), "short": short, "long": long}
 
 
+# --------------------------------------------------------------------------- GEX intensity gauge
+# Where is today's net GEX inside its own historical range?  Positive and negative readings are scaled
+# separately (against the largest positive / most negative value in the lookback) so the gauge is symmetric
+# around zero even when the history is lopsided: -100 = the most negative GEX in the window, +100 = the most
+# positive, 0 = the zero-gamma line.  Display only; it is not an input to the direction score.
+GEX_GAUGE_ZONES = [   # (from, to, label, colour)
+    (-100, -80, "Extreme negative", "#b71c1c"), (-80, -50, "Strong negative", "#e53935"),
+    (-50, -15, "Moderate negative", "#ef9a9a"), (-15, 15, "Neutral", "#9e9e9e"),
+    (15, 50, "Moderate positive", "#a5d6a7"), (50, 80, "Strong positive", "#43a047"),
+    (80, 100, "Extreme positive", "#1b5e20")]
+
+_GEX_MEANING = {
+    ("Negative", "Extreme"): "Dealers are about as short gamma as this history gets: hedging flows amplify moves, and "
+                             "washout-type selling is possible. Extremes can also precede snap-backs, so confirm with price.",
+    ("Negative", "Strong"): "Heavily short gamma: moves in either direction are likely to be exaggerated by dealer hedging.",
+    ("Negative", "Moderate"): "Short gamma but well off the extreme: hedging adds some fuel to moves.",
+    ("Positive", "Extreme"): "Dealers are about as long gamma as this history gets: hedging suppresses volatility and "
+                             "pins price; breakouts need a catalyst.",
+    ("Positive", "Strong"): "Heavily long gamma: dips tend to be bought and rallies sold, so ranges compress.",
+    ("Positive", "Moderate"): "Long gamma but modest: mild damping of moves.",
+}
+
+
+def gex_intensity(series: pd.Series, window: int | None = 252, min_obs: int = 30, neutral: float = 15.0):
+    """Gauge reading for a signed net-GEX history (oldest first). None when there is too little history.
+
+    score  -100..+100 as described above.   pctile = share of the window's readings below today's.
+    level  Neutral / Moderate / Strong / Extreme by |score| (15 / 50 / 80 cut-offs).
+    """
+    s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
+    if len(s) < min_obs:
+        return None
+    win = s.tail(window) if window else s
+    now = float(win.iloc[-1])
+    hi, lo = float(win.max()), float(win.min())
+    if now > 0:
+        score = 100.0 * now / hi
+    elif now < 0:
+        score = 100.0 * now / abs(lo)
+    else:
+        score = 0.0
+    score = float(max(-100.0, min(100.0, score)))
+    a = abs(score)
+    level = "Neutral" if a < neutral else ("Moderate" if a < 50 else ("Strong" if a < 80 else "Extreme"))
+    sign = "Negative" if now < 0 else "Positive"
+    pctile = float(((win < now).sum() + 0.5 * (win == now).sum()) / len(win))
+    meaning = ("Near the zero-gamma line: little net dealer hedging pressure either way, and the sign can flip "
+               "on a small move in spot.") if level == "Neutral" else _GEX_MEANING[(sign, level)]
+    return {"value": now, "score": score, "sign": sign, "level": level,
+            "label": "Neutral" if level == "Neutral" else f"{level} {sign.lower()}", "pctile": pctile,
+            "hist_min": lo, "hist_max": hi, "n": int(len(win)), "meaning": meaning}
+
+
+def gex_gauge_svg(gi: dict, size: int = 300) -> str:
+    """Semicircle gauge as one self-contained SVG string (left = most negative GEX, right = most positive)."""
+    cx, cy, ro, ri = 150.0, 140.0, 118.0, 80.0
+
+    def pt(score, r):
+        phi = math.pi * (1.0 - (score + 100.0) / 200.0)          # -100 -> 180 deg (left), +100 -> 0 deg (right)
+        return cx + r * math.cos(phi), cy - r * math.sin(phi)
+
+    parts = [f'<svg viewBox="0 0 300 200" width="{size}" xmlns="http://www.w3.org/2000/svg" role="img" '
+             f'aria-label="GEX intensity gauge: {gi["score"]:+.0f} ({gi["label"]})" '
+             'style="max-width:100%;height:auto;font-family:sans-serif">']
+    for a, b, name, col in GEX_GAUGE_ZONES:
+        x1, y1 = pt(a, ro)
+        x2, y2 = pt(b, ro)
+        x3, y3 = pt(b, ri)
+        x4, y4 = pt(a, ri)
+        parts.append(f'<path d="M{x1:.1f},{y1:.1f} A{ro},{ro} 0 0 1 {x2:.1f},{y2:.1f} L{x3:.1f},{y3:.1f} '
+                     f'A{ri},{ri} 0 0 0 {x4:.1f},{y4:.1f} Z" fill="{col}" stroke="#ffffff" stroke-opacity="0.55" '
+                     f'stroke-width="1"><title>{name}</title></path>')
+    nx, ny = pt(gi["score"], ro - 8)
+    parts.append(f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" stroke="currentColor" stroke-width="3.5" '
+                 'stroke-linecap="round"/>')
+    parts.append(f'<circle cx="{cx}" cy="{cy}" r="7" fill="currentColor"/>')
+    mid = (ro + ri) / 2.0
+    for tx, ty, txt in ((cx - mid, cy + 15, "-100"), (cx, pt(0, ro + 6)[1], "0"), (cx + mid, cy + 15, "+100")):
+        parts.append(f'<text x="{tx:.1f}" y="{ty:.1f}" font-size="11" fill="currentColor" fill-opacity="0.7" '
+                     f'text-anchor="middle">{txt}</text>')
+    parts.append(f'<text x="{cx}" y="177" font-size="26" font-weight="700" fill="currentColor" '
+                 f'text-anchor="middle">{gi["score"]:+.0f}</text>')
+    parts.append(f'<text x="{cx}" y="194" font-size="12" fill="currentColor" fill-opacity="0.8" '
+                 f'text-anchor="middle">{gi["label"]}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 # --------------------------------------------------------------------------- candlestick data and Vega-Lite spec
 UP_COLOR, DOWN_COLOR = "#26a69a", "#ef5350"
 OVERLAYS = {
@@ -1184,6 +1272,7 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
     strategies = pick_strategies(builder, ds["band"], reg["effective"], opts.get("top_n", 5))
     hs = hc.set_index("Date")
     gex_trend = trend_card(hs["GEX Net OI"])
+    gex_gauge = gex_intensity(hs["GEX Net OI"])
     dex_trend = trend_card(hs["DEX Net OI"])
     dex_window = np.nan
     if dex_exp is not None:
@@ -1209,7 +1298,7 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
                                    walls.get("call_wall") if walls else None, vc_params)
     return {"vanna_charm": vc, "squeeze": sq, "oi": oi, "oi_walls": wall_oi_tags(oi, walls), "oi_params": {**OI_DEFAULTS, **oi_params},
             "agg_flip": af,
-            "gex_trend": gex_trend, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
+            "gex_trend": gex_trend, "gex_gauge": gex_gauge, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
             "candle_mode": candle_mode, "hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
             "flow": fl, "flow_symbol": flow_symbol, "flow_source": flow_source, "dex_hist": float(last["dex"]), "dex_exp": dexs,
             "ivrank": ivr, "edge": edge, "ivtab": ivtab, "walls": walls, "em": em, "gex_exp": gex_exp,

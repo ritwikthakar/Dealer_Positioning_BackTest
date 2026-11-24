@@ -1,0 +1,295 @@
+From c60aaae1b2f33c61255c22ff90e775f747e63416 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 21:49:16 -0500
+Subject: [PATCH] Add GEX intensity gauge to the Score & regime tab
+
+Scores today's net GEX against its own historical range (-100 = most negative in the window, +100 = most positive, positive and negative sides scaled separately). Self-contained SVG gauge, no new dependencies, selectable lookback window. Display only; not part of the direction score. Bumps CORE_VERSION to 2026-11-23.1.
+---
+ app.py                | 35 +++++++++++++++-
+ core.py               | 93 +++++++++++++++++++++++++++++++++++++++++-
+ test_gex_intensity.py | 95 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 220 insertions(+), 3 deletions(-)
+ create mode 100644 test_gex_intensity.py
+
+diff --git a/app.py b/app.py
+index af8c67d..af2dbff 100644
+--- a/app.py
++++ b/app.py
+@@ -21,7 +21,7 @@ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
+ 
+ # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
+ # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
+-EXPECTED_CORE = "2026-11-22.1"
++EXPECTED_CORE = "2026-11-23.1"
+ if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
+     core = importlib.reload(core)
+ if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
+@@ -379,6 +379,39 @@ with tab_over:
+                                f"{nd.date() if nd is not None else 'n/a'}: {g['flip_nearest']:.1f}). "
+                                "The near-flip check uses this figure. Model estimates.")
+ 
++    # ---- GEX intensity gauge: where today's net GEX sits inside its own historical range
++    with st.container(border=True):
++        st.markdown("**GEX intensity gauge**")
++        lookbacks = {"60 sessions": 60, "120 sessions": 120, "1 year (252 sessions)": 252, "Full history": None}
++        g_left, g_right = st.columns([1, 1])
++        with g_right:
++            lb_choice = st.selectbox("Lookback window", list(lookbacks), index=2, key="gex_gauge_lookback",
++                                     help="History the gauge is scaled against. A shorter window makes it react "
++                                          "to recent extremes; a longer one measures against the full range.")
++        gi = core.gex_intensity(R["hist"].set_index("Date")["GEX Net OI"], window=lookbacks[lb_choice])
++        if gi is None:
++            with g_left:
++                st.caption("Not enough GEX history in the history file to draw the gauge (needs 30+ sessions).")
++        else:
++            svg = core.gex_gauge_svg(gi)
++            with g_left:
++                if hasattr(st, "html"):
++                    st.html(f'<div style="color:inherit">{svg}</div>')
++                else:
++                    st.markdown(svg, unsafe_allow_html=True)
++            with g_right:
++                st.markdown(f"**{gi['label']}**")
++                st.caption(gi["meaning"])
++                m1, m2 = st.columns(2)
++                m1.metric("Net GEX (history file)", fmt_big(gi["value"]))
++                m2.metric("Percentile in window", f"{gi['pctile']:.0%}")
++                st.caption(f"Window range {fmt_big(gi['hist_min'])} to {fmt_big(gi['hist_max'])} over "
++                           f"{gi['n']} sessions.")
++        st.caption("Scale: -100 is the most negative net GEX in the window, +100 the most positive, 0 the zero-gamma "
++                   "line (positive and negative sides scaled separately). All-expiry, open-interest based, using the "
++                   "standard dealer convention (long calls, short puts), so treat it as a model estimate. Display "
++                   "only: it does not feed the direction score or the strategy matrix.")
++
+     # ---- vanna & charm positioning and the short-squeeze checklist
+     st.subheader("Vanna & charm positioning")
+     vc, sq = R["vanna_charm"], R["squeeze"]
+diff --git a/core.py b/core.py
+index 57db6b4..de28d9c 100644
+--- a/core.py
++++ b/core.py
+@@ -20,7 +20,7 @@ import pandas as pd
+ 
+ import vanna_charm
+ 
+-CORE_VERSION = "2026-11-22.1"   # app.py refuses to run against a core.py with a different stamp
++CORE_VERSION = "2026-11-23.1"   # app.py refuses to run against a core.py with a different stamp
+ 
+ BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
+ 
+@@ -885,6 +885,94 @@ def trend_card(series: pd.Series, short: int = 5, long: int = 20, z_window: int
+             "tail": s.tail(60), "short": short, "long": long}
+ 
+ 
++# --------------------------------------------------------------------------- GEX intensity gauge
++# Where is today's net GEX inside its own historical range?  Positive and negative readings are scaled
++# separately (against the largest positive / most negative value in the lookback) so the gauge is symmetric
++# around zero even when the history is lopsided: -100 = the most negative GEX in the window, +100 = the most
++# positive, 0 = the zero-gamma line.  Display only; it is not an input to the direction score.
++GEX_GAUGE_ZONES = [   # (from, to, label, colour)
++    (-100, -80, "Extreme negative", "#b71c1c"), (-80, -50, "Strong negative", "#e53935"),
++    (-50, -15, "Moderate negative", "#ef9a9a"), (-15, 15, "Neutral", "#9e9e9e"),
++    (15, 50, "Moderate positive", "#a5d6a7"), (50, 80, "Strong positive", "#43a047"),
++    (80, 100, "Extreme positive", "#1b5e20")]
++
++_GEX_MEANING = {
++    ("Negative", "Extreme"): "Dealers are about as short gamma as this history gets: hedging flows amplify moves, and "
++                             "washout-type selling is possible. Extremes can also precede snap-backs, so confirm with price.",
++    ("Negative", "Strong"): "Heavily short gamma: moves in either direction are likely to be exaggerated by dealer hedging.",
++    ("Negative", "Moderate"): "Short gamma but well off the extreme: hedging adds some fuel to moves.",
++    ("Positive", "Extreme"): "Dealers are about as long gamma as this history gets: hedging suppresses volatility and "
++                             "pins price; breakouts need a catalyst.",
++    ("Positive", "Strong"): "Heavily long gamma: dips tend to be bought and rallies sold, so ranges compress.",
++    ("Positive", "Moderate"): "Long gamma but modest: mild damping of moves.",
++}
++
++
++def gex_intensity(series: pd.Series, window: int | None = 252, min_obs: int = 30, neutral: float = 15.0):
++    """Gauge reading for a signed net-GEX history (oldest first). None when there is too little history.
++
++    score  -100..+100 as described above.   pctile = share of the window's readings below today's.
++    level  Neutral / Moderate / Strong / Extreme by |score| (15 / 50 / 80 cut-offs).
++    """
++    s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
++    if len(s) < min_obs:
++        return None
++    win = s.tail(window) if window else s
++    now = float(win.iloc[-1])
++    hi, lo = float(win.max()), float(win.min())
++    if now > 0:
++        score = 100.0 * now / hi
++    elif now < 0:
++        score = 100.0 * now / abs(lo)
++    else:
++        score = 0.0
++    score = float(max(-100.0, min(100.0, score)))
++    a = abs(score)
++    level = "Neutral" if a < neutral else ("Moderate" if a < 50 else ("Strong" if a < 80 else "Extreme"))
++    sign = "Negative" if now < 0 else "Positive"
++    pctile = float(((win < now).sum() + 0.5 * (win == now).sum()) / len(win))
++    meaning = ("Near the zero-gamma line: little net dealer hedging pressure either way, and the sign can flip "
++               "on a small move in spot.") if level == "Neutral" else _GEX_MEANING[(sign, level)]
++    return {"value": now, "score": score, "sign": sign, "level": level,
++            "label": "Neutral" if level == "Neutral" else f"{level} {sign.lower()}", "pctile": pctile,
++            "hist_min": lo, "hist_max": hi, "n": int(len(win)), "meaning": meaning}
++
++
++def gex_gauge_svg(gi: dict, size: int = 300) -> str:
++    """Semicircle gauge as one self-contained SVG string (left = most negative GEX, right = most positive)."""
++    cx, cy, ro, ri = 150.0, 140.0, 118.0, 80.0
++
++    def pt(score, r):
++        phi = math.pi * (1.0 - (score + 100.0) / 200.0)          # -100 -> 180 deg (left), +100 -> 0 deg (right)
++        return cx + r * math.cos(phi), cy - r * math.sin(phi)
++
++    parts = [f'<svg viewBox="0 0 300 200" width="{size}" xmlns="http://www.w3.org/2000/svg" role="img" '
++             f'aria-label="GEX intensity gauge: {gi["score"]:+.0f} ({gi["label"]})" '
++             'style="max-width:100%;height:auto;font-family:sans-serif">']
++    for a, b, name, col in GEX_GAUGE_ZONES:
++        x1, y1 = pt(a, ro)
++        x2, y2 = pt(b, ro)
++        x3, y3 = pt(b, ri)
++        x4, y4 = pt(a, ri)
++        parts.append(f'<path d="M{x1:.1f},{y1:.1f} A{ro},{ro} 0 0 1 {x2:.1f},{y2:.1f} L{x3:.1f},{y3:.1f} '
++                     f'A{ri},{ri} 0 0 0 {x4:.1f},{y4:.1f} Z" fill="{col}" stroke="#ffffff" stroke-opacity="0.55" '
++                     f'stroke-width="1"><title>{name}</title></path>')
++    nx, ny = pt(gi["score"], ro - 8)
++    parts.append(f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" stroke="currentColor" stroke-width="3.5" '
++                 'stroke-linecap="round"/>')
++    parts.append(f'<circle cx="{cx}" cy="{cy}" r="7" fill="currentColor"/>')
++    mid = (ro + ri) / 2.0
++    for tx, ty, txt in ((cx - mid, cy + 15, "-100"), (cx, pt(0, ro + 6)[1], "0"), (cx + mid, cy + 15, "+100")):
++        parts.append(f'<text x="{tx:.1f}" y="{ty:.1f}" font-size="11" fill="currentColor" fill-opacity="0.7" '
++                     f'text-anchor="middle">{txt}</text>')
++    parts.append(f'<text x="{cx}" y="177" font-size="26" font-weight="700" fill="currentColor" '
++                 f'text-anchor="middle">{gi["score"]:+.0f}</text>')
++    parts.append(f'<text x="{cx}" y="194" font-size="12" fill="currentColor" fill-opacity="0.8" '
++                 f'text-anchor="middle">{gi["label"]}</text>')
++    parts.append("</svg>")
++    return "".join(parts)
++
++
+ # --------------------------------------------------------------------------- candlestick data and Vega-Lite spec
+ UP_COLOR, DOWN_COLOR = "#26a69a", "#ef5350"
+ OVERLAYS = {
+@@ -1184,6 +1272,7 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
+     strategies = pick_strategies(builder, ds["band"], reg["effective"], opts.get("top_n", 5))
+     hs = hc.set_index("Date")
+     gex_trend = trend_card(hs["GEX Net OI"])
++    gex_gauge = gex_intensity(hs["GEX Net OI"])
+     dex_trend = trend_card(hs["DEX Net OI"])
+     dex_window = np.nan
+     if dex_exp is not None:
+@@ -1209,7 +1298,7 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
+                                    walls.get("call_wall") if walls else None, vc_params)
+     return {"vanna_charm": vc, "squeeze": sq, "oi": oi, "oi_walls": wall_oi_tags(oi, walls), "oi_params": {**OI_DEFAULTS, **oi_params},
+             "agg_flip": af,
+-            "gex_trend": gex_trend, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
++            "gex_trend": gex_trend, "gex_gauge": gex_gauge, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
+             "candle_mode": candle_mode, "hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
+             "flow": fl, "flow_symbol": flow_symbol, "flow_source": flow_source, "dex_hist": float(last["dex"]), "dex_exp": dexs,
+             "ivrank": ivr, "edge": edge, "ivtab": ivtab, "walls": walls, "em": em, "gex_exp": gex_exp,
+diff --git a/test_gex_intensity.py b/test_gex_intensity.py
+new file mode 100644
+index 0000000..6238ef8
+--- /dev/null
++++ b/test_gex_intensity.py
+@@ -0,0 +1,95 @@
++"""Tests for the GEX intensity gauge (core.gex_intensity / core.gex_gauge_svg). No data files needed.
++Usage: python3 -I test_gex_intensity.py"""
++import sys
++import xml.etree.ElementTree as ET
++
++import numpy as np
++import pandas as pd
++
++sys.path.insert(0, __file__.rsplit("/", 1)[0] if "/" in __file__ else ".")
++import core  # noqa: E402
++
++rng = np.random.default_rng(0)
++
++
++def series(vals):
++    return pd.Series(vals, index=pd.date_range("2025-01-01", periods=len(vals), freq="B"))
++
++
++# --- too little history -> None
++assert core.gex_intensity(series(np.arange(10.0))) is None
++
++# --- lopsided history: min -4e9, max +1e9
++base = np.concatenate([rng.uniform(-4e9, 1e9, 99)])
++base[0], base[1] = -4e9, 1e9                      # pin the extremes
++
++# today at the most negative value -> -100, Extreme negative
++g = core.gex_intensity(series(np.append(base, -4e9)))
++assert abs(g["score"] + 100) < 1e-9 and g["level"] == "Extreme" and g["sign"] == "Negative", g
++assert g["label"] == "Extreme negative"
++
++# today at half the worst negative -> -50, Strong (>= 50)
++g = core.gex_intensity(series(np.append(base, -2e9)))
++assert abs(g["score"] + 50) < 1e-9 and g["level"] == "Strong", g
++
++# positive side is scaled by the positive max (1e9), not the negative min: +0.5e9 -> +50
++g = core.gex_intensity(series(np.append(base, 0.5e9)))
++assert abs(g["score"] - 50) < 1e-9 and g["sign"] == "Positive", g
++
++# near zero -> Neutral
++g = core.gex_intensity(series(np.append(base, 1e6)))
++assert g["level"] == "Neutral" and g["label"] == "Neutral" and abs(g["score"]) < 15, g
++g = core.gex_intensity(series(np.append(base, 0.0)))
++assert g["score"] == 0.0 and g["level"] == "Neutral", g
++
++# new all-time high / low clip at +-100 and a bigger value never exceeds the scale
++g = core.gex_intensity(series(np.append(base, 9e9)))
++assert g["score"] == 100.0 and g["level"] == "Extreme", g
++g = core.gex_intensity(series(np.append(base, -9e9)))
++assert g["score"] == -100.0, g
++
++# all-positive history with no negatives: still defined
++g = core.gex_intensity(series(np.linspace(1e8, 2e9, 60)))
++assert g["score"] == 100.0 and g["hist_min"] == 1e8
++
++# NaNs ignored; string-ish values coerced
++s = series(np.append(base, -2e9))
++s.iloc[5] = np.nan
++assert len(s) == 100 and core.gex_intensity(s)["n"] == 99      # the NaN is dropped
++
++# lookback window: an old extreme outside the window no longer sets the scale
++long = np.concatenate([[-8e9], rng.uniform(-1e9, 1e9, 299), [-1e9]])
++full = core.gex_intensity(series(long), window=None)
++recent = core.gex_intensity(series(long), window=60)
++assert full["n"] == 301 and recent["n"] == 60
++assert abs(full["score"]) < abs(recent["score"]) or recent["score"] <= -99, (full["score"], recent["score"])
++
++# percentile: today's value is the lowest in the window -> ~0
++g = core.gex_intensity(series(np.append(base, -4e9)))
++assert g["pctile"] < 0.02, g["pctile"]
++
++# --- SVG is well-formed XML, has all 7 zones, shows the score and the label
++g = core.gex_intensity(series(np.append(base, -3e9)))
++svg = core.gex_gauge_svg(g)
++root = ET.fromstring(svg)
++ns = "{http://www.w3.org/2000/svg}"
++assert len(root.findall(f"{ns}path")) == len(core.GEX_GAUGE_ZONES) == 7
++assert f'{g["score"]:+.0f}' in svg and g["label"] in svg
++assert "nan" not in svg.lower()
++
++# needle points left for negative, right for positive, straight up at zero
++def needle_x(gi):
++    r = ET.fromstring(core.gex_gauge_svg(gi))
++    ln = r.find(f"{ns}line")
++    return float(ln.get("x2"))
++
++assert needle_x(core.gex_intensity(series(np.append(base, -3e9)))) < 150
++assert needle_x(core.gex_intensity(series(np.append(base, 0.8e9)))) > 150
++assert abs(needle_x(core.gex_intensity(series(np.append(base, 0.0)))) - 150) < 0.1
++
++# --- the version stamp in core.py matches the one app.py demands
++import re
++app_src = open(__file__.rsplit("/", 1)[0] + "/app.py" if "/" in __file__ else "app.py").read()
++assert re.search(rf'EXPECTED_CORE = "{re.escape(core.CORE_VERSION)}"', app_src), "bump EXPECTED_CORE in app.py"
++
++print("test_gex_intensity: all checks passed")
+-- 
+2.43.0
+

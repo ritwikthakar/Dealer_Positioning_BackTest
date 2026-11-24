@@ -21,7 +21,7 @@ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
 # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
 # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
-EXPECTED_CORE = "2026-11-22.1"
+EXPECTED_CORE = "2026-11-23.1"
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
     core = importlib.reload(core)
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
@@ -378,6 +378,39 @@ with tab_over:
                                f"(range {g['flip_min']:.0f} to {g['flip_max']:.0f}; nearest expiry "
                                f"{nd.date() if nd is not None else 'n/a'}: {g['flip_nearest']:.1f}). "
                                "The near-flip check uses this figure. Model estimates.")
+
+    # ---- GEX intensity gauge: where today's net GEX sits inside its own historical range
+    with st.container(border=True):
+        st.markdown("**GEX intensity gauge**")
+        lookbacks = {"60 sessions": 60, "120 sessions": 120, "1 year (252 sessions)": 252, "Full history": None}
+        g_left, g_right = st.columns([1, 1])
+        with g_right:
+            lb_choice = st.selectbox("Lookback window", list(lookbacks), index=2, key="gex_gauge_lookback",
+                                     help="History the gauge is scaled against. A shorter window makes it react "
+                                          "to recent extremes; a longer one measures against the full range.")
+        gi = core.gex_intensity(R["hist"].set_index("Date")["GEX Net OI"], window=lookbacks[lb_choice])
+        if gi is None:
+            with g_left:
+                st.caption("Not enough GEX history in the history file to draw the gauge (needs 30+ sessions).")
+        else:
+            svg = core.gex_gauge_svg(gi)
+            with g_left:
+                if hasattr(st, "html"):
+                    st.html(f'<div style="color:inherit">{svg}</div>')
+                else:
+                    st.markdown(svg, unsafe_allow_html=True)
+            with g_right:
+                st.markdown(f"**{gi['label']}**")
+                st.caption(gi["meaning"])
+                m1, m2 = st.columns(2)
+                m1.metric("Net GEX (history file)", fmt_big(gi["value"]))
+                m2.metric("Percentile in window", f"{gi['pctile']:.0%}")
+                st.caption(f"Window range {fmt_big(gi['hist_min'])} to {fmt_big(gi['hist_max'])} over "
+                           f"{gi['n']} sessions.")
+        st.caption("Scale: -100 is the most negative net GEX in the window, +100 the most positive, 0 the zero-gamma "
+                   "line (positive and negative sides scaled separately). All-expiry, open-interest based, using the "
+                   "standard dealer convention (long calls, short puts), so treat it as a model estimate. Display "
+                   "only: it does not feed the direction score or the strategy matrix.")
 
     # ---- vanna & charm positioning and the short-squeeze checklist
     st.subheader("Vanna & charm positioning")
