@@ -21,7 +21,7 @@ st.set_page_config(page_title="Regime & Strategy Selector", layout="wide")
 
 # app.py and core.py must come from the same release. A stale cached module is reloaded once; a genuinely
 # old core.py file stops the app with a clear message instead of a KeyError deep inside a tab.
-EXPECTED_CORE = "2026-11-23.1"
+EXPECTED_CORE = "2026-11-23.2"
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
     core = importlib.reload(core)
 if getattr(core, "CORE_VERSION", None) != EXPECTED_CORE:
@@ -56,7 +56,45 @@ def fmt_sh(x: float) -> str:
     return "n/a" if x is None or np.isnan(x) else f"{x / 1e6:+.2f}M sh"
 
 
-VC_TREND_COLS = {"vanna_put_sh_per_pt": "Put-side vanna (M shares per vol pt)",
+def empirical_vanna_ui(R, vc):
+    """Vanna estimated from the history file (rolling regression), so the trend exists without daily chain files."""
+    with st.container(border=True):
+        st.markdown("**Empirical vanna (estimated from the history file)**")
+        wins = {"60 sessions": 60, "120 sessions": 120, "1 year (252 sessions)": 252}
+        left, right = st.columns([1, 2])
+        with left:
+            choice = st.selectbox("Rolling window", list(wins), index=1, key="emp_vanna_window",
+                                  help="Sessions used for each regression. Shorter reacts faster but is noisier.")
+        ev = vanna_charm.empirical_vanna(R["hist"], window=wins[choice])
+        if not ev.get("ok"):
+            st.info(ev.get("reason", "Empirical vanna is unavailable."))
+            return
+        lt, s = ev["latest"], ev["series"]
+        with left:
+            st.metric("Delta added if IV falls 1 pt", fmt_sh(lt["buy_sh_per_pt"]))
+            st.caption(f"About ${lt['buy_usd_per_pt'] / 1e9:+.2f}B per vol point as of {lt['date'].date()}. "
+                       f"Positive = market delta rises when IV falls, which is dealer buying if dealers are short the puts.")
+            weak = abs(lt["t"]) < 2
+            st.caption(f"t-stat {lt['t']:+.1f}, R² {lt['r2']:.2f} over {lt['n']} sessions"
+                       + (" (**weak: not statistically distinguishable from zero**)" if weak else "")
+                       + f"; |t| >= 2 in {ev['sig_share']:.0%} of windows.")
+            if vc and vc.get("ok"):
+                chain_usd = vc["put_vanna"] * R["spot"]
+                st.caption(f"Cross-check, chain-based today (OTM puts): {fmt_sh(vc['put_vanna'])}, about "
+                           f"${chain_usd / 1e9:+.2f}B per vol point"
+                           + (f"; empirical is {lt['buy_usd_per_pt'] / chain_usd:.1f}x that." if chain_usd else "."))
+        with right:
+            st.line_chart((s["buy_sh_per_pt"] / 1e6).rename("M shares per vol point").to_frame(), height=210)
+        st.caption("Method: each day, the change in net DEX is regressed on the change in 30d IV, controlling for price "
+                   "(directly and through GEX). The IV coefficient is the delta that IV moves add to the market, over a "
+                   f"rolling window (DEX read at a {ev['lag']}-row lag, chosen by fit). Unlike the chain-based figure it "
+                   "covers all expiries and both calls and puts and needs no strike data, but it is noisy (price and IV "
+                   "move together; open-interest turnover also moves DEX), looks backward, and assumes DEX Net OI is in "
+                   "dollars. If the cross-check ratio looks like the share price, that assumption is wrong. Model estimate, "
+                   "not a forecast.")
+
+
+VC_TREND_COLS ={"vanna_put_sh_per_pt": "Put-side vanna (M shares per vol pt)",
                  "charm_put_sh_per_day": "Put-side charm (M shares per day)",
                  "vanna_call_sh_per_pt": "Call-side vanna, if dealers are long the calls (M shares per vol pt)",
                  "charm_call_sh_per_day": "Call-side charm, if dealers are long the calls (M shares per day)"}
@@ -419,6 +457,7 @@ with tab_over:
     vc_trend_slot = None
     if not vc.get("ok"):
         st.info(vc.get("reason", "Vanna / charm positioning is unavailable."))
+        empirical_vanna_ui(R, vc)
     else:
         lo, hi = vc["window"]
         a1, a2, a3 = st.columns(3)
@@ -436,6 +475,8 @@ with tab_over:
                        f"net charm {fmt_sh(vc['net_charm'])} per day.")
         st.caption(f"Window {lo}-{hi} DTE, OTM options only, positive = dealers buy the underlying. Vanna and charm only "
                    "become buying when implied vol actually falls or time passes; they are potential flow, not a price forecast.")
+
+        empirical_vanna_ui(R, vc)
 
         vc_trend_slot = st.container()      # filled further down, once the snapshot log has been loaded
 

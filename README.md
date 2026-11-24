@@ -20,6 +20,14 @@ the same folder / uploader for true candles; it is detected automatically.
 Dealer cards: GEX and DEX trend (strengthening / weakening / steady, from the history file), and the aggregate gamma
 flip (zero-crossing of the GEX-by-strike profile, plus the gamma-weighted per-expiry flip used for the near-flip check).
 
+GEX intensity gauge: today's net GEX scored -100..+100 against its own range in a selectable lookback (positive and
+negative sides scaled separately; 0 = zero-gamma line). Display only; it does not feed the score.
+
+Empirical vanna (Vanna & charm section): a rolling regression of daily DEX changes on 30d IV changes (controlling for
+price and gamma) gives a vanna estimate and a history from the history file alone, so no stack of daily chain files is
+needed. It is noisy and backward-looking; the card shows its t-stat and cross-checks it against the chain-based number.
+Replace it with real historical vanna if a data source (e.g. OptionCharts) provides one.
+
 Open-interest change (display only, never in the score): the chain's oi_chg column is parsed ('+9 (+40.91%)'; a dash
 means unknown, not zero). The Score tab shows net call/put OI change, put share of adds, one-day turnover and a
 build / erode tag on the put and call walls. The Dealer map tab has the change by strike, by expiration and by

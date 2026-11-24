@@ -27,7 +27,7 @@ file is used to show how often the same trigger fired and what followed, and tha
 import numpy as np
 import pandas as pd
 
-VC_VERSION = "2026-11-21.1"
+VC_VERSION = "2026-11-23.1"
 
 CONVENTIONS = {
     "puts": "OTM puts only (dealers short puts; calls ignored)",
@@ -114,6 +114,98 @@ def positioning(chain: pd.DataFrame, spot: float, asof: pd.Timestamp, params: di
         "put_oi": float(puts["open_interest"].sum()), "call_oi": float(calls["open_interest"].sum()),
         "by_zone": by_zone, "by_dte": by_dte, "top": top, "scenarios": scen,
     }
+
+
+# --------------------------------------------------------------------------- empirical vanna (history file only)
+def _ols(X: np.ndarray, y: np.ndarray):
+    """OLS slope vector, its standard errors, and R^2.  X already contains the constant column."""
+    n, k = X.shape
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    dof = max(n - k, 1)
+    s2 = float(resid @ resid) / dof
+    try:
+        cov = s2 * np.linalg.inv(X.T @ X)
+        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    except np.linalg.LinAlgError:
+        se = np.full(k, np.nan)
+    tss = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - float(resid @ resid) / tss if tss > 0 else float("nan")
+    return beta, se, r2
+
+
+def empirical_vanna(hc: pd.DataFrame | None, window: int = 120, min_obs: int = 60, lags=(0, 1)) -> dict:
+    """Aggregate vanna estimated from the history file alone (no strike-level data needed).
+
+    The chain file gives vanna exactly but only for one day.  The history file has a daily row with the market's
+    net option delta (`DEX Net OI`), net gamma (`GEX Net OI`), 30d IV and the close, so the sensitivity of delta to
+    implied vol can be read off empirically.  Each day:
+
+        d(DEX) = a + b * d(IV30, vol points) + c * GEX[t-1] * return% + e * return% + noise
+
+    The GEX*return term removes the delta change that comes from price moving through gamma, the return term
+    absorbs the rest of the price dependence, and `b` is the delta added (in the DEX unit) per +1 vol point of IV.
+    Rolling OLS over `window` sessions gives a series.
+
+        dealer_buy_usd_per_pt = -b   (positive = market net delta RISES when IV falls 1 pt)
+
+    Under the same assumption the chain-based number uses (dealers are short the OTM puts), that rise in delta is
+    dealer buying.  Treat it as an estimate: open-interest turnover and expiries also move DEX, price and IV are
+    strongly correlated (so `b` is noisy; see the t-stat), it describes what happened over the window rather than
+    today's strike-level positioning, and it assumes DEX Net OI is in dollars (compare it with the chain-based
+    figure; a ratio near the share price would mean the column is in shares).
+
+    The history row for a date may describe open interest as of the previous close, so the DEX change is tried
+    against same-day and next-row changes (`lags`) and the lag with the better full-sample R^2 is used.
+    """
+    need = ["Close Price", "IV 30d", "DEX Net OI", "GEX Net OI"]
+    if hc is None:
+        return _empty("No option history available.")
+    d = hc.set_index("Date") if "Date" in hc.columns else hc.copy()
+    missing = [c for c in need if c not in d.columns]
+    if missing:
+        return _empty("History file is missing: " + ", ".join(missing) + ".")
+    px = pd.to_numeric(d["Close Price"], errors="coerce").astype(float)
+    iv = pd.to_numeric(d["IV 30d"], errors="coerce").astype(float)
+    dex = pd.to_numeric(d["DEX Net OI"], errors="coerce").astype(float)
+    gex = pd.to_numeric(d["GEX Net OI"], errors="coerce").astype(float)
+    ret = px.pct_change() * 100.0
+    x_iv = iv.diff()
+    x_gam = gex.shift(1) * ret
+    names = ["const", "d_iv", "ret", "gex_ret"]
+
+    def design(lag: int) -> pd.DataFrame:
+        f = pd.DataFrame({"y": dex.diff().shift(-lag), "const": 1.0, "d_iv": x_iv, "ret": ret, "gex_ret": x_gam, "px": px})
+        return f.replace([np.inf, -np.inf], np.nan).dropna()
+
+    full = {}
+    for lag in lags:
+        f = design(lag)
+        if len(f) < max(min_obs, 10):
+            continue
+        beta, se, r2 = _ols(f[names].to_numpy(float), f["y"].to_numpy(float))
+        full[lag] = {"beta": float(beta[1]), "se": float(se[1]), "r2": float(r2), "n": int(len(f))}
+    if not full:
+        return _empty(f"Not enough usable history rows (need {min_obs}+ sessions with price, IV, GEX and DEX).")
+    lag = max(full, key=lambda k: (-1.0 if np.isnan(full[k]["r2"]) else full[k]["r2"]))
+    f = design(lag)
+    w = int(max(min(window, len(f)), 30))
+    X, y = f[names].to_numpy(float), f["y"].to_numpy(float)
+    rows = []
+    for i in range(w - 1, len(f)):
+        beta, se, r2 = _ols(X[i - w + 1:i + 1], y[i - w + 1:i + 1])
+        rows.append((f.index[i], float(beta[1]), float(se[1]), float(r2), float(f["px"].iloc[i])))
+    s = pd.DataFrame(rows, columns=["date", "beta", "se", "r2", "px"]).set_index("date")
+    s["t"] = s["beta"] / s["se"].replace(0.0, np.nan)
+    s["buy_usd_per_pt"] = -s["beta"]
+    s["buy_sh_per_pt"] = s["buy_usd_per_pt"] / s["px"]
+    last = s.iloc[-1]
+    tt = s["t"].dropna()
+    return {"ok": True, "series": s, "window": w, "lag": int(lag), "full": full[lag], "lag_scores": full,
+            "latest": {"date": s.index[-1], "beta": float(last["beta"]), "se": float(last["se"]), "t": float(last["t"]),
+                       "r2": float(last["r2"]), "buy_usd_per_pt": float(last["buy_usd_per_pt"]),
+                       "buy_sh_per_pt": float(last["buy_sh_per_pt"]), "px": float(last["px"]), "n": w},
+            "sig_share": float((tt.abs() >= 2.0).mean()) if len(tt) else float("nan")}
 
 
 # --------------------------------------------------------------------------- squeeze alert

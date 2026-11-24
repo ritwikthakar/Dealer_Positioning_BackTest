@@ -20,7 +20,7 @@ import pandas as pd
 
 import vanna_charm
 
-CORE_VERSION = "2026-11-23.1"   # app.py refuses to run against a core.py with a different stamp
+CORE_VERSION = "2026-11-23.2"   # app.py refuses to run against a core.py with a different stamp
 
 BANDS = ["Bearish", "Mild Bearish", "Neutral", "Mild Bullish", "Bullish"]
 
@@ -1296,10 +1296,11 @@ def analyse(data: dict, weights: dict, opts: dict) -> dict:
     oi = oi_change_tables(chain, spot, asof, opts.get("reg_min_dte", 1), opts.get("reg_max_dte", 45), oi_params)
     vc_params = {k: v for k, v in (opts.get("vanna_charm") or {}).items() if k in vanna_charm.DEFAULTS}
     vc = vanna_charm.positioning(chain, spot, asof, vc_params)
+    emp_vanna = vanna_charm.empirical_vanna(hc, window=int(opts.get("emp_vanna_window", 120)))
     af = profile_flip(gs, spot)
     sq = vanna_charm.squeeze_alert(hc, vc, reg["effective"], spot, af["flip"] if af else None,
                                    walls.get("call_wall") if walls else None, vc_params)
-    return {"vanna_charm": vc, "squeeze": sq, "oi": oi, "oi_walls": wall_oi_tags(oi, walls), "oi_params": {**OI_DEFAULTS, **oi_params},
+    return {"vanna_charm": vc, "emp_vanna": emp_vanna, "squeeze": sq, "oi": oi, "oi_walls": wall_oi_tags(oi, walls), "oi_params": {**OI_DEFAULTS, **oi_params},
             "agg_flip": af,
             "gex_trend": gex_trend, "gex_gauge": gex_gauge, "dex_trend": dex_trend, "dex_window": dex_window, "candles": candles,
             "candle_mode": candle_mode, "hist": hc, "asof": asof, "spot": spot, "components": comps, "direction": ds, "regime": reg,
