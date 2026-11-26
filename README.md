@@ -61,5 +61,22 @@ Files: `screener_tab.py` (UI) and `donchian_screener.py` (logic, also runnable a
 Needs `yfinance` and `lxml` (see requirements.txt) and internet access from wherever the app runs.
 Tests: `python3 test_screener_tab.py` (tab, stand-in Streamlit) and `python3 test_screener.py` (screener logic).
 
+## Portfolio tab
+"Portfolio" tab (after Gamma screener; also available before any option files are loaded). Three sections:
+- **Positions & advice**: one row per leg (trade name groups legs into a calendar, spread, condor...). Shows cash, open P&L,
+  equity, portfolio return, capital at risk, and for each trade a BOOK PROFIT / HOLD / CUT LOSS / ADJUST call with the reasons,
+  breakevens at the first expiry, probability of profit, Greeks, a payoff chart (today vs first expiry) and an IV what-if slider.
+  "Fetch live prices & marks" pulls spot and mid prices from Yahoo (delayed); marks you type win over model prices.
+- **Evaluate a trade**: pick a structure (long call/put, verticals, straddle/strangle, iron condor, calendars, double calendar,
+  diagonals), set strikes and expiries, and see cost, max profit / loss, breakevens, probability of profit, expected value,
+  sizing against your per-trade risk budget and cash, then add it to the portfolio.
+- **Closed trades & return**: realised P&L, win rate, profit factor, and the total portfolio return.
+
+Rules (stop-loss, targets, time exits, "tested" distance) are editable under "Account, model and rules". Calendars and diagonals are
+valued at the first expiry with each leg's IV held fixed; there is no payoff curve at the later expiry because the long leg's result
+depends on what you do next. Positions live in the browser session: use the download buttons to keep them and import them later.
+Files: `portfolio_tab.py` (UI) and `portfolio_core.py` (pricing, breakevens, advisor, portfolio maths; no scipy).
+Tests: `python3 -m pytest test_portfolio_core.py -q`.
+
 ## Link
 https://dealerpositioningbacktest-vydwrk6jfuj4ysbptutjxa.streamlit.app/
