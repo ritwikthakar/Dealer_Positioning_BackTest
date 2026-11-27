@@ -51,6 +51,12 @@ def _be_text(be):
     return ", ".join(f"{b:,.2f}" for b in be) if be else "none"
 
 
+def _be_show(col, label, be):
+    """Breakevens as wrapping text: st.metric truncates long values with an ellipsis."""
+    col.caption(label)
+    col.markdown(f"<div style='font-size:1.9rem;font-weight:600;line-height:1.3'>{_be_text(be)}</div>", unsafe_allow_html=True)
+
+
 def _for_editor(df, date_cols):
     d = df.copy()
     for c in date_cols:
@@ -334,13 +340,13 @@ def _detail(m, S, g):
     c[3].metric("Profit target", _money(a["target_amt"]))
     c[4].metric("Stop", "-" + _money(a["stop_amt"]))
     sf = m["stats_first"]
-    c = st.columns(5)
     if m["first_exp"] is not None:
+        _be_show(st.columns(1)[0], f"Breakevens @ {m['first_exp']:%d %b}", sf["breakevens"])
+        c = st.columns(4)
         c[0].metric(f"Max profit @ {m['first_exp']:%d %b}", _money(sf["max_profit"]))
-        c[1].metric(f"Breakevens @ {m['first_exp']:%d %b}", _be_text(sf["breakevens"]))
-        c[2].metric("Probability of profit", _pct(100 * m["pop_first"], 0), help="Lognormal at the default IV, zero skew. A model number, not a forecast.")
-        c[3].metric("Expected move (1σ)", f"±{m['em_first']:,.2f}")
-        c[4].metric("DTE (first / last)", f"{m['dte_first']} / {m['dte_last']}")
+        c[1].metric("Probability of profit", _pct(100 * m["pop_first"], 0), help="Lognormal at the default IV, zero skew. A model number, not a forecast.")
+        c[2].metric("Expected move (1σ)", f"±{m['em_first']:,.2f}")
+        c[3].metric("DTE (first / last)", f"{m['dte_first']} / {m['dte_last']}")
     gk = m["greeks"]
     c = st.columns(4)
     c[0].metric("Net delta (shares)", f"{gk['delta']:+,.1f}")
@@ -418,12 +424,13 @@ def _evaluate_tab(S, summary):
     c[3].metric("Reward / risk", f"{risk_reward:.2f}" if risk_reward is not None else "n/a")
     c[4].metric("Expected value", _money(m["ev_first"], plus=True),
                 help="Probability-weighted P&L at the first expiry under a lognormal at the default IV, zero skew, held IVs. Model number.")
-    c = st.columns(5)
-    c[0].metric(f"Breakevens @ {m['first_exp']:%d %b}", _be_text(sf["breakevens"]))
-    c[1].metric("Breakevens today", _be_text(m["breakevens_today"]))
-    c[2].metric("Probability of profit", _pct(100 * m["pop_first"], 0))
-    c[3].metric("Expected move (1σ)", f"±{m['em_first']:,.2f}")
-    c[4].metric("Days to first expiry", m["dte_first"])
+    c = st.columns(2)
+    _be_show(c[0], f"Breakevens @ {m['first_exp']:%d %b}", sf["breakevens"])
+    _be_show(c[1], "Breakevens today", m["breakevens_today"])
+    c = st.columns(3)
+    c[0].metric("Probability of profit", _pct(100 * m["pop_first"], 0))
+    c[1].metric("Expected move (1σ)", f"±{m['em_first']:,.2f}")
+    c[2].metric("Days to first expiry", m["dte_first"])
     gk = m["greeks"]
     c = st.columns(4)
     c[0].metric("Net delta $", _money(m["dollar_delta"], plus=True))
