@@ -151,13 +151,36 @@ assert LOG["vega"][-1]["layer"][0]["encoding"]["x"]["type"] == "temporal"
 yf.download = download
 print("3b 1-hour: interval reaches the downloader, hourly stamps, ordinal chart, daily unaffected")
 
+# ---- 3c. Liquid list universe (the Gamma screener's list), first option and default
+import gamma_screener as gs
+assert tab.UNIVERSES == ["Liquid list", "S&P 500", "My tickers"] and len(set(gs.LIQUID)) == len(gs.LIQUID) > 50
+REQ = []
+def download_rec(tickers, start=None, **k):
+    REQ.extend(tickers); return download(tickers, start, **k)
+yf.download = download_rec
+OV.clear(); st.session_state.clear()
+for k_ in ("errors", "infos", "frames", "vega", "texts", "progress"): LOG[k_].clear()
+OV.update(scr_run=True)                                                        # no universe override: radio default
+tab.render()
+assert not LOG["errors"], LOG["errors"]
+assert sorted(set(REQ)) == sorted(gs.LIQUID) and st.session_state["scr_res"].attrs["n_tickers"] == len(gs.LIQUID), len(REQ)
+assert tab.universe_tickers("Liquid list") == list(gs.LIQUID) and tab.universe_tickers("Liquid list") is not gs.LIQUID
+assert tab.universe_tickers("My tickers", "aapl msft") == ["AAPL", "MSFT"]
+# a missing gamma_screener module is reported, not a crash
+saved = sys.modules.pop("gamma_screener"); sys.modules["gamma_screener"] = None
+st.session_state.clear()                                                        # no stale results, so no drill-down download either
+OV.update(scr_universe="Liquid list"); LOG["errors"].clear(); REQ.clear(); tab.render()
+assert any("Liquid list universe" in e for e in LOG["errors"]) and not REQ, LOG["errors"]
+sys.modules["gamma_screener"] = saved; yf.download = download
+print("3c liquid list: first/default option, uses gamma_screener.LIQUID, missing module reported")
+
 # ---- 4. empty result, S&P path failure, missing package, drill-down failure
 OV.clear(); st.session_state.clear(); LOG["errors"].clear(); LOG["infos"].clear()
 OV.update(scr_run=True, scr_universe="My tickers", scr_tickers="NODATA")
 tab.render(); assert st.session_state["scr_res"].empty and any("No setups" in t for t in LOG["infos"]), LOG
 OV.update(scr_universe="S&P 500"); LOG["errors"].clear()
 sc.get_sp500_tickers = lambda: (_ for _ in ()).throw(RuntimeError("offline"))
-tab.render(); assert any("S&P 500 list" in e for e in LOG["errors"]), LOG["errors"]
+tab.render(); assert any("S&P 500 universe" in e for e in LOG["errors"]), LOG["errors"]
 OV.update(scr_universe="My tickers", scr_tickers="R1, R2, R3"); LOG["errors"].clear()
 del sys.modules["yfinance"]
 real_import = __import__

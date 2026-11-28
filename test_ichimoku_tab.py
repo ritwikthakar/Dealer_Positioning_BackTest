@@ -182,13 +182,34 @@ assert LOG["vega"][-1]["layer"][3]["encoding"]["x"]["type"] == "temporal"
 yf.download = download
 print("4b 1-hour: interval reaches the downloader, hourly stamps, ordinal chart with 26 projected session bars, daily unaffected")
 
+# ---- 4c. Liquid list universe (the Gamma screener's list), first option and default
+import gamma_screener as gs
+assert tab.dtab.UNIVERSES == ["Liquid list", "S&P 500", "My tickers"]
+REQ = []
+def download_rec(tickers, start=None, **k):
+    REQ.extend(tickers); return download(tickers, start, **k)
+yf.download = download_rec
+OV.clear(); st.session_state.clear()
+for k_ in ("errors", "infos", "frames", "vega", "texts", "dl", "progress"): LOG[k_].clear()
+OV.update(ich_run=True)                                                        # no universe override: radio default
+tab.render()
+assert not LOG["errors"], LOG["errors"]
+assert sorted(set(REQ)) == sorted(gs.LIQUID) and st.session_state["ich_res"].attrs["n_tickers"] == len(gs.LIQUID), len(REQ)
+# a missing gamma_screener module is reported, not a crash
+saved = sys.modules.pop("gamma_screener"); sys.modules["gamma_screener"] = None
+st.session_state.clear()                                                        # no stale results, so no drill-down download either
+OV.update(ich_universe="Liquid list"); LOG["errors"].clear(); REQ.clear(); tab.render()
+assert any("Liquid list universe" in e for e in LOG["errors"]) and not REQ, LOG["errors"]
+sys.modules["gamma_screener"] = saved; yf.download = download
+print("4c liquid list: first/default option, uses gamma_screener.LIQUID, missing module reported")
+
 # ---- 5. empty result, S&P path failure, missing package
 OV.clear(); st.session_state.clear(); LOG["errors"].clear(); LOG["infos"].clear()
 OV.update(ich_run=True, ich_universe="My tickers", ich_tickers="NODATA")
 tab.render(); assert st.session_state["ich_res"].empty and any("No setups" in t for t in LOG["infos"]), LOG
 OV.update(ich_universe="S&P 500"); LOG["errors"].clear()
 dsc.get_sp500_tickers = lambda: (_ for _ in ()).throw(RuntimeError("offline"))
-tab.render(); assert any("S&P 500 list" in e for e in LOG["errors"]), LOG["errors"]
+tab.render(); assert any("S&P 500 universe" in e for e in LOG["errors"]), LOG["errors"]
 OV.update(ich_universe="My tickers", ich_tickers="R1, R2, R3"); LOG["errors"].clear()
 del sys.modules["yfinance"]
 real_import = __import__

@@ -109,6 +109,20 @@ def _one(ticker, start, interval="1d"):
     return sc.extract(raw, ticker)
 
 
+UNIVERSES = ["Liquid list", "S&P 500", "My tickers"]       # same choices and order as the Gamma screener
+
+
+def universe_tickers(universe, custom=""):
+    """Ticker list for a universe radio choice. 'Liquid list' is the Gamma screener's list of names with liquid options
+    (gamma_screener.LIQUID), so a technical scan can be limited to stocks that also have a usable option chain."""
+    if universe == "Liquid list":
+        import gamma_screener as gs
+        return list(gs.LIQUID)
+    if universe == "S&P 500":
+        return _sp500()
+    return parse_tickers(custom)
+
+
 def pick_timeframe(col, key):
     """Timeframe selectbox. Returns (yfinance interval, label)."""
     import donchian_screener as sc
@@ -130,7 +144,9 @@ def render(show_vega=None):
                "Daily or 1-hour data from Yahoo Finance via yfinance; the latest bar is dropped until it has finished. "
                "Candidate list for review, not trade signals.")
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    universe = c1.radio("Universe", ["S&P 500", "My tickers"], horizontal=True, key="scr_universe")
+    universe = c1.radio("Universe", UNIVERSES, horizontal=True, key="scr_universe",
+                        help="Liquid list: about 90 names with liquid options (the Gamma screener's list). Fast, and every name "
+                             "can also be checked for gamma.")
     interval, tf_label = pick_timeframe(c2, "scr_tf")
     lookback = c3.number_input("Look back (bars)", 0, 10, 3, key="scr_lookback",
                                help="Report breakouts, squeeze breaks and failures whose trigger was within this many bars "
@@ -143,9 +159,9 @@ def render(show_vega=None):
 
     if run_it:
         try:
-            tickers = _sp500() if universe == "S&P 500" else parse_tickers(custom)
+            tickers = universe_tickers(universe, custom)
         except Exception as e:
-            st.error(f"Could not load the S&P 500 list ({e}). Use 'My tickers' instead.")
+            st.error(f"Could not load the {universe} universe ({e}). Use 'My tickers' instead.")
             tickers = []
         if not tickers:
             st.warning("No tickers to scan.")
@@ -168,7 +184,8 @@ def render(show_vega=None):
 
     res = st.session_state.get("scr_res")
     if res is None:
-        st.info("Choose a universe and press Run screener. The S&P 500 scan downloads about 500 tickers and takes a minute or two.")
+        st.info("Choose a universe and press Run screener. The liquid list (~90 names) is quick; the S&P 500 scan downloads "
+                "about 500 tickers and takes a minute or two.")
         _notes()
         return
 

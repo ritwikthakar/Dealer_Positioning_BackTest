@@ -110,7 +110,9 @@ def render(show_vega=None):
                "computed 26 bars earlier, so nothing looks ahead. Daily or 1-hour data from Yahoo Finance via yfinance; the latest bar "
                "is dropped until it has finished. Candidate list for review, not trade signals.")
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    universe = c1.radio("Universe", ["S&P 500", "My tickers"], horizontal=True, key="ich_universe")
+    universe = c1.radio("Universe", dtab.UNIVERSES, horizontal=True, key="ich_universe",
+                        help="Liquid list: about 90 names with liquid options (the Gamma screener's list). Fast, and every name "
+                             "can also be checked for gamma.")
     interval, tf_label = dtab.pick_timeframe(c2, "ich_tf")
     lookback = c3.number_input("Look back (bars)", 0, 10, 3, key="ich_lookback",
                                help="Report TK crosses, cloud breaks and twists whose trigger was within this many bars "
@@ -124,9 +126,9 @@ def render(show_vega=None):
 
     if run_it:
         try:
-            tickers = dtab._sp500() if universe == "S&P 500" else dtab.parse_tickers(custom)
+            tickers = dtab.universe_tickers(universe, custom)
         except Exception as e:
-            st.error(f"Could not load the S&P 500 list ({e}). Use 'My tickers' instead.")
+            st.error(f"Could not load the {universe} universe ({e}). Use 'My tickers' instead.")
             tickers = []
         if not tickers:
             st.warning("No tickers to scan.")
@@ -149,7 +151,8 @@ def render(show_vega=None):
 
     res = st.session_state.get("ich_res")
     if res is None:
-        st.info("Choose a universe and press Run screener. The S&P 500 scan downloads about 500 tickers and takes a minute or two.")
+        st.info("Choose a universe and press Run screener. The liquid list (~90 names) is quick; the S&P 500 scan downloads "
+                "about 500 tickers and takes a minute or two.")
         _notes()
         return
 
